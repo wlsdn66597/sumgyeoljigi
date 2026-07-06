@@ -1,0 +1,9 @@
+scenario,expected,got,ok
+comfort,-,-,1
+co2_high,ventilate,ventilate,1
+dry,humidify,humidify,1
+hot,cool,cool,1
+cold,heat,heat,1
+bright_sleep,dim_light,dim_light,1
+bright_awake,-,-,1
+multi,cool|dim_light|humidify|ventilate,cool|dim_light|humidify|ventilate,1

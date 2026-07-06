@@ -1,0 +1,17 @@
+[Unit]
+Description=NUNI Streamlit Dashboard (viewer)
+After=network-online.target mosquitto.service nuni-edge.service
+Wants=network-online.target mosquitto.service
+
+[Service]
+Type=simple
+User=sooin
+WorkingDirectory=/home/sooin/sumgyeoljigi
+Environment=NUNI_BUS=mqtt
+Environment=NUNI_DASHBOARD_ONLY=1
+ExecStart=/home/sooin/sumgyeoljigi/.venv/bin/streamlit run app.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

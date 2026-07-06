@@ -1,0 +1,6 @@
+policy,false_alarm,miss
+single_sensor,6,0
+radar_only,0,2
+audio_only,2,2
+env_only,2,3
+full_fusion,0,0

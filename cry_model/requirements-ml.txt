@@ -1,0 +1,9 @@
+# 울음 분류 학습/추론 환경 (Python 3.10~3.11 권장)
+tensorflow==2.15.*
+tensorflow-hub
+librosa
+soundfile
+scikit-learn
+matplotlib
+pandas
+sounddevice        # 마이크 실시간 추론 (파일 추론만이면 생략 가능)

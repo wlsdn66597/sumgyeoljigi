@@ -1,0 +1,14 @@
+streamlit>=1.30
+numpy
+matplotlib       # cloud.py 수면 타임라인 PNG (없어도 리포트는 생성됨)
+paho-mqtt        # 분산(MQTT) 모드용 - inproc 기본 실행엔 불필요
+
+# 실물 울음 분류(YAMNet 학습/추론) 사용 시 추가:
+# tensorflow
+# tensorflow-hub
+# librosa
+# soundfile
+# scikit-learn
+# matplotlib
+# pandas
+# sounddevice     # 마이크 실시간 추론

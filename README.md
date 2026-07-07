@@ -1,200 +1,104 @@
-# NUNI — 비접촉 영유아 케어 AI (소프트웨어)
+# 숨결지기 (Breath-Keeper)
 
-레이더·음향·환경 센서로 **카메라·웨어러블 없이** 영유아의 **수면·상태를 일상적으로
-모니터링**하고, 울음 대응·환경 제어·개인화로 선제 케어하는 AI 시스템의 **소프트웨어
-파이프라인**.
+**카메라·웨어러블 없는 비접촉 영유아 수면·상태 모니터링 AI**
+2026 AI소프트웨어공모전 · 임베디드SW 부문
+
+> 레이더·음향·환경 센서로 **아이에게 붙이지 않고, 아이를 찍지 않으면서도** 매일 쓸 수 있는
+> 상태 정보를 제공한다. 아이가 안정적으로 자는지·뒤척이는지·깼는지·우는지, 방 환경이 불편한지를
+> 엣지에서 융합해 보여주고, 행동 가능한 권고를 제시한다. 드문 호흡 이상은 **안전 백업**으로 감지하되
+> **의료 진단·임상 성능은 표방하지 않는다.**
 
 ---
 
 ## 1. 프로젝트 개요
 
-- **문제**: 부모는 영유아 상태를 계속 확인해야 하는 불안·수면부족을 겪는다. 기존 제품은 웨어러블 착용·카메라 사용이라 프라이버시·거부감 문제가 있다.
-- **해결**: 60GHz 레이더(호흡·움직임)·마이크(울음·음성)·환경센서(온습도·CO₂·조도)를 **멀티모달 융합**해, 카메라 없이 상태를 해석하고 선제 알림/제어한다.
-- **핵심 차별점**: ①비접촉·비영상 ②멀티모달 융합으로 단일센서 오탐 감소 ③엣지 처리로 프라이버시 보호.
+- **문제**: 저출산 시대의 육아 부담은 시간 부족을 넘어, 아이 상태를 계속 확인해야 하는 불안·수면 부족으로 이어진다. 기존 베이비 모니터는 카메라 영상·웨어러블 착용에 의존해 프라이버시 부담·착용 거부·관리 부담이 남는다.
+- **접근**: 60GHz 레이더(호흡·미세 움직임), 마이크(울음·제한 음성), 환경 센서(온습도·CO₂·조도)를 **엣지에서 멀티모달 융합**해, 개별 신호의 정밀 진단이 아니라 보호자가 이해할 수 있는 **"상태 판단 + 행동 가능한 권고"** 를 제공한다.
+- **포지셔닝**: 메인은 **일상 수면·상태 모니터링과 환경 케어**. 무호흡 등 드문 호흡 이상은 상시 모니터링 중 놓치지 않기 위한 **안전 백업**으로 배치한다.
 
-## 2. 시스템 구조
+## 2. 핵심 기능
 
-```
-[센서/음성 입력]  ──(MQTT 토픽)──▶  [엣지 AI 추론]  ──▶  [멀티모달 융합]  ──▶  [대시보드·알림]
- 레이더/환경(가상·실물)              울음분류(YAMNet)        시간동기·교차검증
- 마이크                             음성 인텐트             위험도·불편 판단
-```
-모든 모듈은 MQTT 토픽으로만 통신 → **가상 센서를 실물로 무중단 교체 가능**. (토픽 규격은 §부록)
+| # | 기능 | 요지 |
+|---|---|---|
+| 1 | 비접촉 호흡·움직임 감지 | 레이더 신호에서 호흡수·움직임·무호흡 의심 추정 |
+| 2 | 수면/각성 상태 모니터링 | 안정 수면 / 뒤척임 / 각성 구분 (일상 헤드라인) |
+| 3 | 울음 감지 + 환경·시간 맥락 분석 | 울음 이유 대신, 울음과 함께 나타나는 환경·시간 패턴 추출 |
+| 4 | 개인화 정상 범위 | 아이별 호흡·움직임 baseline 점진 갱신 |
+| 5 | 환경 모니터링·케어 권고 | 가습·조명 권고(가습기·조명), CO₂는 환기 보조 정보 |
+| 6 | 멀티모달 융합 판단 | 여러 신호 교차검증으로 오탐·미탐 감소 |
+| 7 | 알림 안정화 | 디바운스·쿨다운으로 순간 튐·반복 알림 억제 |
+| 8 | 수면 리듬 → 아침 리포트 | 각성 횟수·자주 깬 시간대·안정 수면 비율 요약 |
+| 9 | 부모 상호작용·대시보드 | 상태·환경·권고·이벤트 표시 + 제한 음성/터치 입력 |
+| 10 | 재현 가능한 16단계 검증 | 동일 절차로 결과 재현(`run_all.sh`) |
 
-## 3. 구현 상태
+## 3. 검증 결과 (합성 신호·통제 시나리오 기반)
 
-| 구분 | 항목 |
+> 아래 수치는 **소프트웨어 검증값**이며, 실제 60GHz 하드웨어·실제 영유아·임상 성능이 아니다.
+
+| 항목 | 결과 |
 |---|---|
-| **메인 (일상)** | 수면/각성 상태 분류 · 울음 감지 · 환경 모니터링·선제 제어 · 개인화(적응형 baseline) · 수면 리포트 |
-| **안전 백업 (드묾)** | 호흡 이상/무호흡 감지 알림 (의료기기 아님) |
-| **기반 (완료)** | MQTT 아키텍처 · 멀티모달 융합 엔진 · 대시보드 · 평가 프레임워크 |
-| **2차 데모까지 예정** | 실물 60GHz 레이더·환경센서 통합 · 원거리 마이크 실수음 · 실환경 재검증 |
+| 호흡수 추정 | 평균 절대 오차 **0.5회/분**, 무호흡 약 **4초** 후 감지 |
+| 현실적 레이더 잡음 | 단순 평균 15.0회/분 → **거리구간 선택+잡음억제 0.5회/분** |
+| 수면/각성 분류 | 통제 7 시나리오 **100% 일치** |
+| 개인화 baseline | 두 가구(40·52회/분) → **40.1 / 51.7 수렴** |
+| 환경 권고 | 통제 8 시나리오 **100% 일치** |
+| 멀티모달 융합(통제 11) | 융합 **오탐 0·미탐 0** / 단일센서 오탐 6 / 레이더단독 미탐 2 |
+| 융합 강건성(무작위 2000회) | 단일센서 오탐률 **57.6% → 융합 2.7%** (미탐 0) |
+| 알림 안정화(스트리밍) | 알림 4→1건, 일시 오경보 3→0건, 무호흡 지연 1초 |
+| 음성 인텐트 | 제한 문장 11개 **100%** (실환경 STT는 미검증) |
+| 수면 리듬(5박) | 평균 각성 14회, 자주 깬 시간 3시경, 안정 수면 87% |
 
-## 4. 저장소 구성
+## 4. 시스템 구조
 
 ```
-nuni_demo/
-├─ topics.py            # MQTT 토픽 규격(이름 + 메시지 스키마)
-├─ bus.py               # pub/sub 추상화 (inproc 기본 / mqtt 선택)
-├─ sim_sensors.py       # 레이더·환경 가상 발행자  ← 실물 교체 지점
-├─ cry_classifier.py    # 울음 분류 (시뮬 기본 / REAL=True 시 YAMNet)
-├─ fusion.py            # 멀티모달 융합 판단 + 단일센서 비교 정책
-├─ workers.py           # inproc 백그라운드 워커 기동
-├─ app.py               # Streamlit 실시간 대시보드
-├─ eval_radar.py        # 레이더 호흡 DSP 검증 (MAE)
-├─ eval_radar_robustness.py  # 레이더 강건성 스윕 (SNR·윈도우)
-├─ eval_radar_realistic.py   # 현실적 레이더 DSP (range-bin 선택+디트렌드+대역통과)
-├─ eval_fusion.py       # 융합 vs 단일센서 오탐/미탐 평가 (+경계신호 교차검증)
-├─ eval_fusion_noisy.py # 노이즈 몬테카를로 융합 강건성 재증명
-├─ eval_stream.py       # 스트리밍 시계열 평가 (디바운스·쿨다운 검증)
-├─ sleep_state.py       # 수면/각성 상태 분류 (일상 헤드라인) + eval_sleep_state.py
-├─ personalization.py   # 경량 개인화(적응형 baseline) + eval_personalization.py
-├─ env_control.py       # 선제 환경 제어 권고 + eval_env_control.py
-├─ cry_context.py       # 울음-맥락 상관 분석 + eval_cry_context.py
-├─ sleep_rhythm.py      # 수면 리듬 → 루틴 인사이트 + eval_sleep_rhythm.py
-├─ voice_intent.py      # 부모 음성 인텐트 인식 (키워드/STT)
-├─ cloud.py             # 클라우드 스텁 + 아침 수면 리포트
-├─ requirements.txt     # 데모 실행 의존성
-└─ cry_model/           # 울음 분류 학습 파이프라인
-   ├─ config.py         # 경로·하이퍼파라미터
-   ├─ features.py       # YAMNet 로드 + 임베딩/울음감지(+캐시)
-   ├─ augment.py        # 잔향·소음·거리 증강 (실측 파일 or 합성)
-   ├─ prepare_data.py   # 데이터 인덱싱(화자 group 분리)
-   ├─ train.py          # 전이학습 + held-out 평가 + 혼동행렬
-   ├─ evaluate.py       # 저장 모델 재평가
-   ├─ infer.py          # 마이크/파일 추론
-   ├─ check_env.py      # 학습 전 환경 점검
-   ├─ download_data.py  # 데이터 자동 다운로드
-   └─ requirements-ml.txt
+[센서/입력]                [엣지 AI 추론]              [융합·판단]           [출력]
+레이더 ─┐                  레이더 신호처리             멀티모달 융합          대시보드(실시간)
+마이크 ─┼─(MQTT 토픽)──▶   울음 감지                ─▶ 시간동기·교차검증  ─▶ 알림(정상/주의/경보)
+환경센서┘                  수면/각성 상태             디바운스·쿨다운        환경 케어 권고
+                          음성 인텐트                개인화 baseline       아침 수면 리포트
 ```
+모든 모듈은 **MQTT 토픽**으로만 통신 → 검증에 쓴 **가상 센서를 실물 센서로 인터페이스 변경 없이 교체**할 수 있다.
 
-## 5. 데모 실행 (하드웨어 불필요)
+## 5. 실행 (하드웨어 없이 재현)
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-streamlit run app.py          # 대시보드 (사이드바로 울음/무호흡 주입)
-python eval_fusion.py         # 융합 성능 비교표
+bash run_all.sh          # 16단계 재현 검증 → results/ 생성
+streamlit run app.py     # 실시간 대시보드
 ```
 
-## 6. 울음 분류 학습 (핵심 AI)
+## 6. 2차 데모까지 확장 계획
 
-```bash
-source .venv/bin/activate
-pip install -r cry_model/requirements-ml.txt
+2차 데모의 핵심 전략은 **새 기능을 다시 만드는 것이 아니라, 검증된 소프트웨어를 실물 센서·화면에 연결**하는 것이다. 기존 메시지 주제 체계·데이터 형식을 유지하면 융합·상태저장·대시보드·리포트·개인화·환경권고는 큰 변경 없이 재사용된다.
 
-python cry_model/download_data.py cry     # Donate-a-Cry → cry_model/data/
-python cry_model/download_data.py noise   # (선택) ESC-50 → cry_model/noise/
-python cry_model/check_env.py             # 라이브러리·YAMNet·데이터 점검
-python cry_model/prepare_data.py cry_model/data   # 클래스 분포 확인
-python cry_model/train.py cry_model/data --aug 2  # 학습 → cry_model/artifacts/
-python cry_model/evaluate.py cry_model/data       # held-out 재평가
-```
-학습 후 데모에 연결: `cry_classifier.py`에서 `REAL = True`.
+**(1) 입력 계층 실물 교체**
+- 가상 레이더·환경·울음 입력 → 실제 **60GHz 레이더·환경 센서(온습도·CO₂·조도)·마이크** 로 교체(동일 토픽).
+- 센서별 측정 주기·시간 동기화·통신 지연·결측 처리·설치 각도에 따른 신호 품질 점검.
 
-## 7. 필요한 데이터셋
+**(2) 호흡 감지 실물 검증 (성인 대상 · 영유아 아님)**
+- 성인 안정 호흡 중 **수동 측정 호흡수 vs 레이더 추정** 비교, 짧은 숨 참기로 호흡 신호 감소가 반영되는지 확인.
+- ⚠️ 실제 영유아 성능·의료적 무호흡 탐지 검증이 아니라, **실물 레이더 입력↔소프트웨어 처리 연결**을 확인하는 기능 검증.
 
-| 데이터 | 용도 | 출처 |
-|---|---|---|
-| Donate-a-Cry Corpus | 울음 이유 분류 학습(필수) | github.com/gveres/donateacry-corpus |
-| Infant Cry Audio Corpus | 표본 보강(권장) | Kaggle |
-| ESC-50 | 증강 소음 + 감지 오탐 검증 | github.com/karoldvl/ESC-50 |
-| MUSAN / RIR(OpenAIR 등) | 실측 소음·잔향 증강 | openslr.org/17 |
-| YAMNet | 사전학습 백본(자동 로드) | TF Hub |
+**(3) 환경 케어 실물 연동 (반자동)**
+- 가습기·조명 또는 모의 액추에이터를 연결해 **권고 → 실제 동작** 흐름 시연. 안전을 위해 초기엔 **보호자 확인 후 실행되는 반자동** 방식.
 
-> ⚠️ Donate-a-Cry는 표본이 적고 불균형 → 증강·class_weight·전이학습으로 보완, rare 클래스는 합쳐 거친 카테고리로.
+**(4) 인형 기반 모의 환경 검증**
+- 실제 아기 대신 **인형 기반 모의 환경**에서 습도·조도 변화와 울음·움직임 이벤트를 주입 → 환경-상태 패턴을 함께 기록·요약하는 흐름 시연.
 
-## 8. 받아와야 할 결과물 (보고서용)
+**(5) 데모 시나리오 4종**
+1. 성인 비접촉 호흡 측정, 2. 안정 수면, 3. 뒤척임/울음(반복 경보 억제 확인), 4. 환경 권고(가습·조명).
 
-| 산출물 | 생성 방법 | 보고서 위치 |
-|---|---|---|
-| **융합 vs 단일 오탐/미탐 표** | `python eval_fusion.py` | 구현기능 — 융합 효과 |
-| **혼동행렬 이미지** | `train.py` → `cry_model/artifacts/confusion_matrix.png` | 구현기능 — 울음 분류 |
-| **Macro-F1 / 클래스별 성능** | `train.py`·`evaluate.py` 출력 | 구현기능 — 울음 분류 |
-| **대시보드 스크린샷** | `streamlit run app.py` 실행 화면 | 작품 사진 / 구현기능 |
-| **E2E 지연 측정** | 이벤트→알림 타임스탬프 | 검증 방법 및 결과 |
+**(6) 안정성·폴백**
+- 실물 통합 지연에 대비해 **가상 입력을 예비 입력으로 유지** → 일부 하드웨어가 늦어도 수면상태·환경권고·리포트·융합 흐름은 안정 시연.
 
-## 9. Reproducible Software Verification
+**(7) 제품화 요건 (후속)**
+- 저출력 60GHz 전파 인증, 영유아 사용 안전성, 개인정보 저장 정책·보호자 동의 절차 검토.
 
-하드웨어 없이 재현 가능한 검증 스크립트를 제공한다. 아래 결과는 현재 코드 기준으로 `bash run_all.sh`를 실행해 얻은 값이며, 실제 60GHz 레이더 하드웨어나 실제 영유아 환경 검증이 아니다.
+## 7. 정직성 및 한계
+- 모든 정량 결과는 **합성 신호·통제 시나리오 기반 소프트웨어 검증**이며, 실제 60GHz 하드웨어·실제 영유아·임상 환경 성능이 아니다.
+- 무호흡/호흡 이상은 **드문 안전 백업**이며 의료기기·진단을 표방하지 않는다.
+- 울음 **이유** 분류는 공개 데이터 한계로 **실험적 기능**으로 두고, 대신 **울음-맥락 상관**을 참고 정보로 제공한다.
 
-```bash
-python3 -m venv .venv
-source .venv/bin/activate
-pip install -r requirements.txt
-bash run_all.sh
-streamlit run app.py
-```
-
-### 핵심 결과
-
-| 영역 | 항목 | 결과 | 조건/산출물 |
-|---|---|---:|---|
-| Radar DSP | BPM MAE | 0.500 breaths/min | synthetic raw radar-like signal, 30s, fs=50Hz, SNR 15dB |
-| Radar DSP | Apnea detection | True, delay 4.0s | synthetic apnea scenario |
-| Radar DSP | Motion detection | True | synthetic motion burst |
-| Fusion | full_fusion false alarm / miss | 0 / 0 | controlled scenarios 11개 |
-| Fusion | single_sensor false alarm / miss | 6 / 0 | controlled scenarios 11개 |
-| Fusion ablation | radar_only false alarm / miss | 0 / 2 | 경계 호흡을 단독으론 놓침 |
-| Fusion ablation | audio_only false alarm / miss | 2 / 2 | cry-only 정책의 오탐/미탐 |
-| Fusion ablation | env_only false alarm / miss | 2 / 3 | 환경 단독 정책의 한계 |
-| Cry reason classifier | Donate-a-Cry 5-class | 실사용 성능 주장 불가 | hungry 83.6% class imbalance |
-
-### 결과 해석
-
-- 레이더 DSP는 실제 센서가 아니라 synthetic raw radar-like signal을 입력으로 검증했다.
-- controlled scenario 11개에서 **full fusion만 false alarm 0, miss 0** 을 기록했다. radar_only는 명확한 무호흡은 잡지만 '경계 호흡'(임계 미만의 이상 호흡)을 단독으론 놓쳐 miss 2가 발생했고, 이는 울음·환경과 교차검증할 때만 경보가 된다. 즉 융합의 가치는 (1) 과민한 단일신호 정책 대비 오탐 감소, (2) 어떤 단일 모달보다 적은 미탐 둘 다에서 나타난다.
-- single_sensor baseline은 단일 신호에 민감하게 반응해 false alarm 6건이 발생했다.
-- Donate-a-Cry 기반 울음 이유 분류는 `hungry`가 382/457개(83.6%)로 치우쳐 있고 rare class가 적어, 현재 결과를 실사용 가능한 이유 분류 성능으로 주장하지 않는다.
-
-### 한계
-
-- 실제 60GHz 레이더 하드웨어 성능을 검증한 결과가 아니다.
-- synthetic apnea/motion smoke test는 실환경 무호흡/움직임 탐지 검증이 아니다.
-- 실제 영유아 대상 성능 또는 임상적 안전성을 검증하지 않았다.
-- YAMNet cry detection 결과는 synthetic negative 기준 smoke test이며 실제 생활 소음에서의 precision을 보장하지 않는다.
-- Donate-a-Cry 5-class reason classifier는 class imbalance 때문에 실험적 기능으로만 다룬다.
-
-주요 산출물:
-
-- `results/RADAR_DSP_RESULT.md`
-- `results/FUSION_EVALUATION_RESULT.md`
-- `results/STREAM_EVAL_RESULT.md` (디바운스·쿨다운 시계열 검증)
-- `results/FUSION_NOISY_RESULT.md` (노이즈 몬테카를로 융합 강건성)
-- `results/RADAR_REALISTIC_RESULT.md` (현실적 레이더 DSP)
-- `results/SLEEP_STATE_RESULT.md` (수면/각성 상태 분류)
-- `results/PERSONALIZATION_RESULT.md` (개인화 적응)
-- `results/ENV_CONTROL_RESULT.md` (선제 환경 제어)
-- `results/CRY_CONTEXT_RESULT.md` (울음-맥락 상관)
-- `results/SLEEP_RHYTHM_RESULT.md` (수면 리듬 루틴 인사이트)
-- `results/VOICE_INTENT_RESULT.md` (음성 인텐트 인식)
-- `results/SLEEP_REPORT.md` (클라우드 아침 수면 리포트)
-- `results/RESULTS.md`
-- `results/RESULTS_FINAL.md`
-
-## 10. 실물 교체 지점 (2차 데모까지)
-
-1. **센서**: `sim_sensors.py`의 `radar_step()/env_step()`를 실물 UART/I2C 읽기로 교체 (토픽 동일)
-2. **울음**: `cry_classifier.py` `REAL=True` + 학습된 `artifacts/` 사용
-3. **분산 실행**: `NUNI_BUS=mqtt` + 로컬 Mosquitto → 각 모듈 별도 프로세스
-
-## 11. 검증 방법 & 정직성
-
-- 울음/음성: **공개 데이터 라벨 = GT**, 화자단위 held-out.
-- 레이더/환경: **시뮬레이션·공개데이터로 검증**(코드에 시뮬 명시), 실물 재검증은 2차.
-- 융합: **통제된 시나리오 정답과 비교**(`eval_fusion.py`).
-- 본 검증은 실제 영유아 임상검증이 아니며, 제품화 시 IRB·임상이 필요하다.
-
----
-
-## 부록 — MQTT 토픽 규격
-
-| 토픽 | 페이로드 |
-|---|---|
-| `sensor/radar` | `{breathing_rate, movement(0~1), presence, ts}` |
-| `sensor/env` | `{temp, humidity, co2, lux, ts}` |
-| `audio/cry` | `{is_crying, cls, confidence, ts}` |
-| `audio/voice` | `{intent, ts}` |
-| `fusion/state` | `{level(normal/attention/alert), reasons[], ts}` |
-| `fusion/alert` | `{level, reason, ts}` |
-| `control/action` | `{actions[], ts}` |
+## 8. 팀
+2026 AI소프트웨어공모전 · 팀 숨결지기 (AI소프트웨어학부)

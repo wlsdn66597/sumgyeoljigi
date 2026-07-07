@@ -1,5 +1,0 @@
-true_bpm,naive_bpm,naive_err,realistic_bpm,realistic_err,picked_bin,true_bin
-20,30.0,10.0,20.0,0.0,3,3
-40,30.0,10.0,40.0,0.0,3,3
-45,30.0,15.0,44.0,1.0,3,3
-55,30.0,25.0,54.0,1.0,3,3

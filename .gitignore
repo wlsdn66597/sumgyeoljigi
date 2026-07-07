@@ -18,9 +18,14 @@ cry_model/artifacts/
 cry_model/artifacts_*/
 cry_model/.emb_cache/
 reports/
-results/logs/
 *.keras
 *.npy
+
+# 검증 산출물 (run_all.sh 로 재생성) · 내부 작업 노트 (로컬 보관)
+results/
+CHANGES_AND_EXPERIMENTS.md
+CHANGES_EVERYDAY_MONITORING.md
+CHANGES_ROBUSTNESS_AND_INSIGHTS.md
 
 # OS
 .DS_Store

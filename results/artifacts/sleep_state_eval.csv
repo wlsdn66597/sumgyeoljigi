@@ -1,8 +1,0 @@
-scenario,expected,pred,ok
-calm_sleep,calm_sleep,calm_sleep,1
-low_move,calm_sleep,calm_sleep,1
-restless,restless,restless,1
-restless_high,restless,restless,1
-awake_move,awake,awake,1
-awake_cry,awake,awake,1
-absent,unknown,unknown,1

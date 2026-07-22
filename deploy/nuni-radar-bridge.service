@@ -1,0 +1,15 @@
+[Unit]
+Description=NUNI Radar Bridge (MR60BHA2 ESPHome -> sensor/radar)
+After=network-online.target mosquitto.service
+Wants=network-online.target mosquitto.service
+
+[Service]
+Type=simple
+User=sooin
+WorkingDirectory=/home/sooin/sumgyeoljigi
+ExecStart=/home/sooin/sumgyeoljigi/.venv/bin/python radar_bridge.py
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

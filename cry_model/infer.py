@@ -57,7 +57,17 @@ class Mic:
 
     def start(self):
         import sounddevice as sd
-        self._stream = sd.InputStream(channels=1, samplerate=self.sr, callback=self._cb)
+        # 기본(default) 입력장치 인덱스(-1)는 USB 마이크를 여러 번 뽑았다 꽂으면
+        # 재열거되면서 불안정해질 수 있다(실측: query_devices에서 0 in으로 보임,
+        # PortAudioError: Error querying device -1). 이름으로 직접 찾아 명시 지정한다.
+        name_hint = os.getenv("NUNI_MIC_NAME", "AB13X")
+        device = None
+        for i, d in enumerate(sd.query_devices()):
+            if name_hint.lower() in d["name"].lower():
+                device = i
+                break
+        self._stream = sd.InputStream(device=device, channels=1, samplerate=self.sr,
+                                      callback=self._cb)
         self._stream.start()
 
     def get_last(self, seconds=1.5):

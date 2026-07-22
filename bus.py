@@ -67,7 +67,15 @@ class MqttBus:
         self.c.publish(topic, json.dumps(payload))
 
     def _on(self, client, userdata, msg):
-        payload = json.loads(msg.payload.decode())
+        raw = msg.payload.decode(errors="replace")
+        try:
+            payload = json.loads(raw)
+        except json.JSONDecodeError:
+            # ESPHome 등 외부 발행자는 "ON"/"OFF"·순수 숫자 같은 비JSON 문자열을
+            # 그대로 보낸다. 여기서 예외가 새면 이 스레드 전체가 조용히 죽어서
+            # "#" 구독 콜백이 전부 멈추므로(실측으로 확인됨), 원본 문자열로
+            # 넘기고 계속 진행한다.
+            payload = raw
         with self.lock:
             subs = list(self.subs)
         for pat, cb in subs:

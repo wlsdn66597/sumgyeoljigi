@@ -1,0 +1,117 @@
+# ─────────────────────────────────────────────────────────────
+# MR60BHA2 (XIAO ESP32C6) — 숨결지기 레이더 노드 ESPHome 설정
+#
+# 하는 일: 60GHz 레이더 상태를 파이의 MQTT 브로커로 발행한다.
+#          → 파이의 radar_bridge.py 가 이를 표준 sensor/radar 로 변환.
+#
+# ★ 굽기 전에 채울 것 3곳 (아래 ← 표시) ★
+#   1) wifi.ssid / password  : 파이와 "같은 네트워크"(핫스팟 등)
+#   2) mqtt.broker           : 그 네트워크에서의 파이 IP
+#                              (핫스팟이면 붙인 뒤 hostname -I 로 확인 → 알려주면 내가 채워줌)
+#   3) ota/포탈 비번          : 원하면 변경(기본값도 동작)
+#
+# 굽는 법: XIAO를 노트북에 USB-C로 연결 → ESPHome 웹 플래셔(또는 esphome CLI)로
+#          이 파일을 컴파일·업로드. 이후엔 USB는 전원만, 데이터는 WiFi.
+# ─────────────────────────────────────────────────────────────
+
+esphome:
+  name: mr60bha2
+  friendly_name: NUNI Radar
+  # XIAO ESP32C6는 RF 스위치(FM8625H)로 내장 세라믹 안테나/외부 u.FL을 선택한다.
+  # 이 GPIO를 명시적으로 설정하지 않으면 안테나 경로가 불확정 상태로 남아
+  # WiFi 스캔에서 아무 네트워크도 안 잡히는 증상이 발생한다(실측 확인됨).
+  # GPIO3=LOW(스위치 활성화), GPIO14=LOW(내장 세라믹 안테나 선택, 기본값).
+  on_boot:
+    priority: 800
+    then:
+      - wifi.disable:
+      - output.turn_off: rf_switch_en
+      - delay: 100ms
+      - output.turn_off: rf_ant_select
+      - delay: 10ms
+      - wifi.enable:
+
+output:
+  - platform: gpio
+    id: rf_switch_en
+    pin: GPIO3
+  - platform: gpio
+    id: rf_ant_select
+    pin: GPIO14
+
+esp32:
+  board: seeed_xiao_esp32c6
+  framework:
+    type: esp-idf          # ESP32-C6는 esp-idf 프레임워크 사용(Arduino 미지원)
+
+logger:
+  hardware_uart: USB_SERIAL_JTAG   # 레이더용 UART(GPIO4/5)와 분리 - 로그를 USB로 확실히 라우팅
+  level: VERY_VERBOSE
+  logs:
+    seeed_mr60bha2: VERY_VERBOSE
+    uart: VERY_VERBOSE
+    uart_debug: VERY_VERBOSE
+
+# 원시 UART 프레임을 mr60bha2/debug(MQTT)로 덤프 - 레이더 칩이 실제로
+# 데이터를 보내는지(배선/프로토콜 문제) 진단하기 위한 임시 설정.
+uart:
+  # Seeed 공식 xiao-esphome-projects 저장소 기준(위키 튜토리얼의 GPIO4/5는 구버전 오기였음).
+  - id: uart_mr60bha2
+    tx_pin: GPIO16
+    rx_pin: GPIO17
+    baud_rate: 115200
+    parity: NONE
+    stop_bits: 1
+    debug:
+      direction: RX
+      dummy_receiver: false
+
+# 파이와 같은 네트워크에 접속
+wifi:
+  # ⚠️ 실제 SSID/비번은 레포에 커밋하지 않는다(자격증명). 굽기 전에 채울 것.
+  #    현재 파이에 플래시된 값 = 폰 핫스팟(SSID/비번은 파이 로컬 ~/sumgyeoljigi/deploy/mr60bha2.yaml 참조).
+  ssid: "YOUR_WIFI_SSID"          # 파이와 같은 네트워크
+  password: "YOUR_WIFI_PASSWORD"
+  # 접속 실패 시 자체 핫스팟으로 폴백(초기 설정/복구용)
+  ap:
+    ssid: "MR60BHA2-setup"
+    password: "12345678"
+
+captive_portal:
+
+# 무선 펌웨어 업데이트(선택) — broker IP 바뀔 때 USB 없이 갱신 가능
+ota:
+  - platform: esphome
+    password: "nuni-ota"          # ←③(선택)
+
+# 파이 MQTT 브로커로 발행 (익명 LAN 브로커 — 이미 개방 완료)
+mqtt:
+  broker: "172.20.10.2"           # 파이의 jinu 핫스팟 IP
+
+# UART: XIAO ↔ 레이더 모듈 내부 연결 (고정값 — 건드리지 말 것. 실제 정의는 위 uart: 블록)
+
+seeed_mr60bha2:
+  uart_id: uart_mr60bha2
+
+# 센서 — radar_bridge.py 가 구독할 "명시적 토픽"으로 발행
+# (이름 자동 변환에 의존하지 않도록 state_topic 을 직접 지정)
+binary_sensor:
+  - platform: seeed_mr60bha2
+    has_target:
+      name: "Presence"
+      state_topic: "mr60bha2/presence"
+
+sensor:
+  - platform: seeed_mr60bha2
+    breath_rate:
+      name: "Breath rate"
+      state_topic: "mr60bha2/breath_rate"
+    heart_rate:
+      name: "Heart rate"
+      state_topic: "mr60bha2/heart_rate"
+    distance:
+      name: "Distance"
+      state_topic: "mr60bha2/distance"
+    num_targets:
+      name: "Target count"
+      state_topic: "mr60bha2/num_targets"

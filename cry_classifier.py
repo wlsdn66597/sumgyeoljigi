@@ -1,10 +1,12 @@
 """울음 분류기.
 
 기본(REAL=False): 시뮬레이션. 하드웨어/모델 없이 파이프라인 검증용.
-실물(REAL=True):  마이크 → YAMNet 임베딩 → 커스텀 헤드 추론 (아래 TODO 구현)
+실물(REAL=True):  마이크 → YAMNet(tflite) 내장 클래스로 울음 유무 직접 판정.
+                  커스텀 이유 분류 헤드는 학습 데이터가 없어 사용하지 않는다
+                  (이유 분류는 실험적이라는 프로젝트 방침과 일치 — cls는 항상
+                  "none"이며, 이유 대신 cry_context.py의 맥락 상관을 사용).
 """
 import os
-import sys
 import random
 import time
 
@@ -12,9 +14,10 @@ import topics
 import bus
 from state_store import store
 
-CLASSES = ["hungry", "sleepy", "discomfort"]
-REAL = False              # True: 학습된 YAMNet 모델 + 마이크로 실제 분류
-CRY_THRESHOLD = 0.5       # 울음 감지 임계값 (YAMNet cry_score)
+CLASSES = ["hungry", "sleepy", "discomfort"]      # REAL=False 시뮬레이션 전용
+REAL = os.getenv("NUNI_CRY_REAL", "0") == "1"
+CRY_THRESHOLD = float(os.getenv("NUNI_CRY_THRESHOLD", "0.3"))   # YAMNet cry_score
+MIC_WINDOW_S = 1.5
 
 _model = None
 _mic = None
@@ -35,19 +38,27 @@ def step() -> dict:
     return topics.cry_msg(False, "none", round(random.uniform(0, 0.3), 2))
 
 
+MIC_NATIVE_SR = int(os.getenv("NUNI_MIC_SR", "48000"))   # USB 마이크가 16kHz 직캡처 미지원(하드웨어 기본이 다름)
+
+
 def classify_yamnet() -> dict:
-    """마이크 최근 1.5초 → YAMNet 울음 감지 + 이유 분류."""
+    """마이크 최근 1.5초(마이크 고유 레이트) → 16kHz 리샘플 → YAMNet 내장
+    클래스로 울음 유무 판정 (이유 분류 없음)."""
     global _model, _mic
     if _model is None:
+        import sys
         sys.path.insert(0, os.path.join(os.path.dirname(__file__), "cry_model"))
-        from infer import CryModel, Mic
-        _model = CryModel.load(os.path.join(os.path.dirname(__file__), "cry_model", "artifacts"))
-        _mic = Mic(); _mic.start()
+        from infer import Mic                  # sounddevice 링버퍼만 재사용(텐서플로우 불요)
+        from yamnet_cry import YamnetCry, resample_linear
+        _model = YamnetCry.load()
+        _mic = Mic(sr=MIC_NATIVE_SR); _mic.start()
+        globals()["_resample"] = resample_linear
 
-    cry_score, reason, conf = _model.predict(_mic.get_last(1.5))
+    raw = _mic.get_last(MIC_WINDOW_S)
+    x16 = _resample(raw, MIC_NATIVE_SR)
+    cry_score, label = _model.predict(x16)
     is_crying = cry_score > CRY_THRESHOLD
-    return topics.cry_msg(is_crying, reason if is_crying else "none",
-                          round(conf if is_crying else cry_score, 2))
+    return topics.cry_msg(is_crying, "none", round(cry_score, 2))
 
 
 def run():

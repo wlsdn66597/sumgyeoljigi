@@ -3,6 +3,7 @@
 Streamlit은 상호작용마다 스크립트를 재실행하므로, 모듈 전역 플래그로
 스레드가 중복 생성되지 않도록 가드한다.
 """
+import os
 import threading
 import time
 
@@ -16,6 +17,11 @@ from fusion import Fusion
 _started = False
 _lock = threading.Lock()
 
+# 실물 센서 전환 스위치: 실물 노드(radar_bridge, scd41_reader)가 해당 토픽을
+# 발행하기 시작하면 가상 발행을 꺼서 충돌을 막는다. (예: NUNI_SIM_RADAR=0)
+_SIM_RADAR = os.getenv("NUNI_SIM_RADAR", "1") != "0"
+_SIM_ENV = os.getenv("NUNI_SIM_ENV", "1") != "0"
+
 
 def _store_writer(topic, payload):
     store.update(topic, payload)
@@ -23,8 +29,10 @@ def _store_writer(topic, payload):
 
 def _sensor_loop():
     while True:
-        bus.publish(topics.RADAR, sim_sensors.radar_step())
-        bus.publish(topics.ENV, sim_sensors.env_step())
+        if _SIM_RADAR:
+            bus.publish(topics.RADAR, sim_sensors.radar_step())
+        if _SIM_ENV:
+            bus.publish(topics.ENV, sim_sensors.env_step())
         time.sleep(1)
 
 

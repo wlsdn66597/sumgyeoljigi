@@ -51,9 +51,19 @@ while True:
     e = snap["latest"].get(topics.ENV, {})
     c = snap["latest"].get(topics.CRY, {})
 
+    # 실물 레이더는 대상이 멀거나 비스듬하면 호흡을 못 잰다. 이때 호흡수 0은
+    # '무호흡'이 아니라 '미측정'이므로, 0을 그대로 띄우면서 "정상"이라고 하면
+    # 모순처럼 보인다. 측정 불가는 별도 상태로 구분해 보여준다.
+    breath_ok = r.get("breath_valid", True)
+    unmeasurable = bool(r.get("presence")) and not breath_ok
+
     with holder.container():
-        reason = ", ".join(snap["fusion"]["reasons"]) or "이상 없음"
-        getattr(st, kind)(f"{icon}  상태: {label}  —  {reason}")
+        if unmeasurable and lv == "normal":
+            st.info("⚪  상태: 호흡 측정 대기  —  재실은 감지되나 호흡 신호를 얻지 못함 "
+                    "(센서 정면 0.5~1m, 가슴을 향하게 두고 잠시 정지)")
+        else:
+            reason = ", ".join(snap["fusion"]["reasons"]) or "이상 없음"
+            getattr(st, kind)(f"{icon}  상태: {label}  —  {reason}")
 
         ss = snap["sleep_state"]
         st.markdown(f"### 수면 상태: {SLEEP_UI.get(ss['state'], ss['state'])}")
@@ -62,7 +72,9 @@ while True:
             st.caption(f"개인화 정상 호흡 범위 {p['bpm_normal_range']} 회/분 (학습 표본 {p.get('samples')})")
 
         c1 = st.columns(4)
-        c1[0].metric("호흡수(회/분)", r.get("breathing_rate", "-"))
+        # 미측정일 때 0을 띄우면 '호흡 정지'로 오해된다 → 측정 불가로 표기
+        c1[0].metric("호흡수(회/분)",
+                     "측정 불가" if unmeasurable else r.get("breathing_rate", "-"))
         c1[1].metric("움직임", r.get("movement", "-"))
         c1[2].metric("울음", c.get("cls") if c.get("is_crying") else "없음")
         c1[3].metric("재실", "있음" if r.get("presence") else "-")

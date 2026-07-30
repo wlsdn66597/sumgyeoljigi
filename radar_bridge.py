@@ -20,6 +20,7 @@ import collections
 import json
 import math
 import os
+import statistics
 import time
 
 import paho.mqtt.client as mqtt
@@ -35,17 +36,29 @@ TOPICS = {
     f"{PREFIX}/distance": "distance",      # cm (움직임 유도용)
 }
 
-APNEA_BPM_MIN = float(os.getenv("NUNI_APNEA_BPM_MIN", "6"))
-APNEA_HOLD_S = float(os.getenv("NUNI_APNEA_HOLD_S", "4"))
+APNEA_HOLD_S = float(os.getenv("NUNI_APNEA_HOLD_S", "6"))
 STALE_S = float(os.getenv("NUNI_RADAR_STALE_S", "10"))
 MOVE_WINDOW_S = float(os.getenv("NUNI_MOVE_WINDOW_S", "2.0"))
 MOVE_SCALE_CM = float(os.getenv("NUNI_MOVE_SCALE_CM", "30"))   # 이만큼 변동 = 움직임 1.0
 HOST = os.getenv("NUNI_MQTT_HOST", "localhost")
 
+# --- 호흡값 신뢰 게이팅 ---
+# 레이더 칩은 조건이 나쁘면(멀거나·움직이거나) 0이나 튄 값을 그대로 뱉는다. 그대로
+# 흘리면 호흡수가 요동치고 "가만히 있는데 무호흡 경보"가 뜬다. 아래 조건을 모두
+# 만족하는 값만 유효로 보고, 유효값들의 중앙값을 발행한다.
+BR_MIN = float(os.getenv("NUNI_BR_MIN", "5"))          # 이 미만은 미검출로 취급
+BR_MAX = float(os.getenv("NUNI_BR_MAX", "60"))         # 영아 상한(성인 대상이면 더 좁혀도 됨)
+DIST_MIN_CM = float(os.getenv("NUNI_DIST_MIN_CM", "20"))
+DIST_MAX_CM = float(os.getenv("NUNI_DIST_MAX_CM", "150"))   # 호흡 유효거리(모듈 스펙 ~1.5m)
+MOVE_REJECT = float(os.getenv("NUNI_MOVE_REJECT", "0.5"))   # 이보다 크게 움직이면 호흡값 신뢰 불가
+SMOOTH_WINDOW_S = float(os.getenv("NUNI_BR_SMOOTH_S", "8"))  # 이 창의 중앙값을 발행
+                                                             # (창이 유지되는 동안은 잠깐 결측이어도 값이 유지됨)
+
 _state = {"breath": None, "heart": None, "presence": None,
           "distance": None, "last_rx": 0.0}
-_low_since = [None]                         # 호흡 저하 시작 시각(무호흡 유도)
 _dist_hist = collections.deque()            # (ts, distance_cm)
+_br_hist = collections.deque()              # (ts, bpm) — 게이팅 통과한 유효값만
+_no_valid_since = [None]                    # 유효 호흡이 끊긴 시각(무호흡 유도)
 
 
 def on_esphome(topic, raw):
@@ -77,31 +90,74 @@ def _movement(now):
     return max(0.0, min(1.0, (max(ds) - min(ds)) / MOVE_SCALE_CM))
 
 
-def derive_apnea(presence, bpm, now):
-    """재실 중 호흡수가 임계 미만으로 APNEA_HOLD_S 지속되면 무호흡 의심."""
-    if not presence or bpm is None:
-        _low_since[0] = None
+def breath_is_trustworthy(bpm, dist, presence, move):
+    """이 순간의 호흡값을 믿을 수 있는가(측정 조건이 갖춰졌는가)."""
+    if not presence or bpm is None or math.isnan(bpm):
         return False
-    if bpm < APNEA_BPM_MIN:
-        if _low_since[0] is None:
-            _low_since[0] = now
-        return (now - _low_since[0]) >= APNEA_HOLD_S
-    _low_since[0] = None
-    return False
+    if not (BR_MIN <= bpm <= BR_MAX):        # 0·튄 값 배제
+        return False
+    if dist is None or math.isnan(dist) or not (DIST_MIN_CM <= dist <= DIST_MAX_CM):
+        return False                          # 유효 거리 밖이면 호흡값 무의미
+    return move <= MOVE_REJECT                # 크게 움직이면 호흡 신호가 묻힘
+
+
+def smoothed_breath(now):
+    """최근 창의 유효 호흡값 중앙값. 유효값이 없으면 None.
+    중앙값이라 한두 개 튄 값에 흔들리지 않는다."""
+    while _br_hist and now - _br_hist[0][0] > SMOOTH_WINDOW_S:
+        _br_hist.popleft()
+    if not _br_hist:
+        return None
+    return statistics.median(b for _, b in _br_hist)
+
+
+def derive_apnea(presence, dist, move, now):
+    """'측정 조건은 갖춰졌는데 유효 호흡이 계속 안 잡히는' 상태를 무호흡 의심으로 본다.
+
+    단순히 bpm이 낮은 순간을 세면, 사람이 움직이거나 멀어져서 생긴 결측을
+    무호흡으로 오탐한다(실측에서 확인됨). 그래서 재실·거리·정지 조건이
+    모두 만족된 상태에서만 '호흡 없음'을 카운트한다.
+    """
+    measurable = (presence and dist is not None and not math.isnan(dist)
+                  and DIST_MIN_CM <= dist <= DIST_MAX_CM and move <= MOVE_REJECT)
+    if not measurable:
+        _no_valid_since[0] = None             # 측정 불가 구간은 판단 보류
+        return False
+    if _br_hist and now - _br_hist[-1][0] <= 1.5:
+        _no_valid_since[0] = None             # 방금 유효 호흡이 잡힘
+        return False
+    if _no_valid_since[0] is None:
+        _no_valid_since[0] = now
+    return (now - _no_valid_since[0]) >= APNEA_HOLD_S
 
 
 def step(now=None):
-    """현재 수신 상태 → sensor/radar 메시지. 데이터 없거나 stale/NaN이면 None."""
+    """현재 수신 상태 → sensor/radar 메시지. 데이터 없거나 stale이면 None."""
     now = now or time.time()
-    b = _state["breath"]
-    if b is None or math.isnan(b) or (now - _state["last_rx"]) > STALE_S:
+    if _state["breath"] is None or (now - _state["last_rx"]) > STALE_S:
         return None
+
     presence = _state["presence"] if _state["presence"] is not None else True
+    dist = _state["distance"]
     move = _movement(now)
-    apnea = derive_apnea(presence, b, now)
-    msg = topics.radar_msg(round(0.0 if apnea else b, 1), round(move, 2), bool(presence))
+    raw_b = _state["breath"]
+
+    if breath_is_trustworthy(raw_b, dist, presence, move):
+        _br_hist.append((now, float(raw_b)))
+
+    apnea = derive_apnea(presence, dist, move, now)
+    smooth = smoothed_breath(now)
+    # 유효값이 잠깐 끊겨도 HOLD_S 동안은 마지막 값을 유지한다(화면 깜빡임 방지).
+    if smooth is None:
+        out_b = 0.0
+    else:
+        out_b = 0.0 if apnea else smooth
+
+    msg = topics.radar_msg(round(out_b, 1), round(move, 2), bool(presence))
     msg.update({"apnea": apnea, "motion": move > 0.5, "source": "mr60bha2",
-                "heart_rate": _state["heart"], "distance": _state["distance"]})
+                "heart_rate": _state["heart"], "distance": dist,
+                "raw_breath": raw_b,                        # 게이팅 전 원본(디버깅·비교용)
+                "breath_valid": smooth is not None})
     return msg
 
 

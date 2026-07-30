@@ -55,8 +55,18 @@ class MqttBus:
         _cbv = getattr(mqtt, "CallbackAPIVersion", None)
         self.c = mqtt.Client(_cbv.VERSION1) if _cbv else mqtt.Client()
         self.c.on_message = self._on
+        self.c.on_connect = self._on_connect
         self.c.connect(host, 1883, 60)
         self.c.loop_start()
+
+    def _on_connect(self, client, userdata, flags, rc):
+        """재접속 때 구독을 복원한다. 브로커가 재시작되거나 네트워크가 끊겼다
+        붙으면 구독이 사라지는데, 이를 복원하지 않으면 서비스는 살아있는데
+        메시지만 영영 안 오는 상태가 된다."""
+        with self.lock:
+            patterns = [p for p, _ in self.subs]
+        for p in patterns:
+            client.subscribe(p)
 
     def subscribe(self, pattern, cb):
         with self.lock:

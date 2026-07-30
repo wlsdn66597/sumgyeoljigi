@@ -50,8 +50,10 @@ def main():
     _cbv = getattr(mqtt, "CallbackAPIVersion", None)
     c = mqtt.Client(_cbv.VERSION1) if _cbv else mqtt.Client()
     c.on_message = _on_message
+    # 구독은 on_connect 안에서 — connect() 직후 subscribe()는 CONNACK 이전이라 유실될 수
+    # 있고, 재접속 시 구독이 복원되지 않는다(부팅 시 데이터 전무 사례 있음).
+    c.on_connect = lambda cl, ud, flags, rc: cl.subscribe("#")
     c.connect(HOST, 1883, 60)
-    c.subscribe("#")
     print(f"[nuni-recorder] recording all topics -> {DATA_DIR}")
     c.loop_forever(retry_first_connection=True)
 

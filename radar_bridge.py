@@ -37,6 +37,8 @@ TOPICS = {
 }
 
 APNEA_HOLD_S = float(os.getenv("NUNI_APNEA_HOLD_S", "6"))
+# 이 시간 안에 유효 호흡을 관측한 적이 있어야 무호흡 판정을 한다(미측정과 구분).
+APNEA_REQUIRE_PRIOR_S = float(os.getenv("NUNI_APNEA_PRIOR_S", "120"))
 STALE_S = float(os.getenv("NUNI_RADAR_STALE_S", "10"))
 MOVE_WINDOW_S = float(os.getenv("NUNI_MOVE_WINDOW_S", "2.0"))
 MOVE_SCALE_CM = float(os.getenv("NUNI_MOVE_SCALE_CM", "30"))   # 이만큼 변동 = 움직임 1.0
@@ -57,8 +59,9 @@ SMOOTH_WINDOW_S = float(os.getenv("NUNI_BR_SMOOTH_S", "8"))  # 이 창의 중앙
 _state = {"breath": None, "heart": None, "presence": None,
           "distance": None, "last_rx": 0.0}
 _dist_hist = collections.deque()            # (ts, distance_cm)
-_br_hist = collections.deque()              # (ts, bpm) — 게이팅 통과한 유효값만
+_br_hist = collections.deque()              # (ts, bpm) — 게이팅 통과한 유효값만(최근 창)
 _no_valid_since = [None]                    # 유효 호흡이 끊긴 시각(무호흡 유도)
+_last_valid = [None]                        # 마지막 유효 호흡 시각(창 밖까지 기억 — 무호흡/미측정 구분용)
 
 
 def on_esphome(topic, raw):
@@ -112,16 +115,21 @@ def smoothed_breath(now):
 
 
 def derive_apnea(presence, dist, move, now):
-    """'측정 조건은 갖춰졌는데 유효 호흡이 계속 안 잡히는' 상태를 무호흡 의심으로 본다.
+    """'잡히던 호흡이 멈춘' 상태만 무호흡 의심으로 본다.
 
-    단순히 bpm이 낮은 순간을 세면, 사람이 움직이거나 멀어져서 생긴 결측을
-    무호흡으로 오탐한다(실측에서 확인됨). 그래서 재실·거리·정지 조건이
-    모두 만족된 상태에서만 '호흡 없음'을 카운트한다.
+    두 가지를 구분하는 게 핵심이다:
+      - 무호흡  : 호흡을 잘 재고 있었는데 갑자기 사라짐        → 경보 대상
+      - 미측정  : 애초에 호흡이 안 잡힘(멀거나·비스듬하거나·물체) → 판단 보류
+    구분하지 않으면 사람이 자세만 바꿔도 무호흡 경보가 뜬다(실측에서 확인됨).
+    그래서 ①측정 조건(재실·유효거리·정지)이 갖춰졌고 ②직전에 유효 호흡을
+    실제로 관측했던 경우에만 '호흡 없음'을 카운트한다.
     """
     measurable = (presence and dist is not None and not math.isnan(dist)
                   and DIST_MIN_CM <= dist <= DIST_MAX_CM and move <= MOVE_REJECT)
-    if not measurable:
-        _no_valid_since[0] = None             # 측정 불가 구간은 판단 보류
+    had_baseline = (_last_valid[0] is not None
+                    and (now - _last_valid[0]) <= APNEA_REQUIRE_PRIOR_S)
+    if not (measurable and had_baseline):
+        _no_valid_since[0] = None             # 측정 불가 or 기준 호흡 없음 → 판단 보류
         return False
     if _br_hist and now - _br_hist[-1][0] <= 1.5:
         _no_valid_since[0] = None             # 방금 유효 호흡이 잡힘
@@ -144,6 +152,7 @@ def step(now=None):
 
     if breath_is_trustworthy(raw_b, dist, presence, move):
         _br_hist.append((now, float(raw_b)))
+        _last_valid[0] = now
 
     apnea = derive_apnea(presence, dist, move, now)
     smooth = smoothed_breath(now)
@@ -165,9 +174,11 @@ def main():
     _cbv = getattr(mqtt, "CallbackAPIVersion", None)
     c = mqtt.Client(_cbv.VERSION1) if _cbv else mqtt.Client()
     c.on_message = lambda cl, ud, m: on_esphome(m.topic, m.payload.decode("utf-8", "replace"))
+    # 구독은 반드시 on_connect 안에서 한다. connect() 직후에 subscribe()하면 CONNACK 이전이라
+    # 브로커가 무시할 수 있고(부팅 시 실측으로 데이터가 전혀 안 들어온 사례 있음),
+    # 재접속 때도 구독이 복원되지 않는다.
+    c.on_connect = lambda cl, ud, flags, rc: [cl.subscribe(t) for t in TOPICS]
     c.connect(HOST, 1883, 60)
-    for t in TOPICS:
-        c.subscribe(t)
     c.loop_start()
     print(f"[radar-bridge] ESPHome '{PREFIX}/*' -> {topics.RADAR} (stale {STALE_S}s)")
     warned = False

@@ -26,7 +26,12 @@ def decide(radar, cry, env):
 
     apnea = bool(radar and radar.get("apnea"))
     br = radar.get("breathing_rate", radar.get("breathing_bpm", 99)) if radar else 99
-    if radar and radar.get("presence") and (apnea or br < 8):
+    # 실물 레이더는 측정 조건이 나쁘면(멀거나·비스듬하거나) 호흡을 못 재고 0을 준다.
+    # 이때의 0은 '무호흡'이 아니라 '미측정'이므로 호흡 판정을 보류한다. 명시적 apnea
+    # 플래그는 브리지가 조건을 확인하고 세운 것이라 그대로 신뢰한다.
+    # (breath_valid 없는 합성/기존 데이터는 True로 간주해 기존 동작을 유지)
+    br_valid = radar.get("breath_valid", True) if radar else True
+    if radar and radar.get("presence") and (apnea or (br_valid and br < 8)):
         level = _max(level, "alert")
         reasons.append("호흡 미검출·무호흡 의심")
 
@@ -43,7 +48,8 @@ def decide(radar, cry, env):
 
     # 경계 신호 교차검증: 단독으론 임계 미만인 '경계 호흡'이 다른 모달과 겹치면 경보로 상향.
     #  -> 레이더 단독은 놓치지만(정상 판정) 융합은 잡는 케이스 = 융합의 고유 가치.
-    irregular = bool(radar and radar.get("presence") and not apnea and (8 <= br <= 15 or br > 55))
+    irregular = bool(radar and radar.get("presence") and not apnea and br_valid
+                     and (8 <= br <= 15 or br > 55))
     bad_env = bool(env and env.get("co2", 0) > 1000)
     if irregular and (cry_flag or bad_env):
         level = _max(level, "alert")

@@ -51,9 +51,10 @@ def _mqtt_listen():
     _cbv = getattr(mqtt, "CallbackAPIVersion", None)
     c = mqtt.Client(_cbv.VERSION1) if _cbv else mqtt.Client()
     c.on_message = on_msg
+    # 구독은 on_connect 안에서(재접속 시에도 복원되도록).
+    c.on_connect = lambda cl, ud, flags, rc: cl.subscribe("demo/breath")
     try:
         c.connect(os.getenv("NUNI_MQTT_HOST", "localhost"), 1883, 60)
-        c.subscribe("demo/breath")
         c.loop_start()
         print("[breath-sim] MQTT 원격 제어 대기 (demo/breath)")
     except OSError:

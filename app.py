@@ -28,6 +28,7 @@ SLEEP_UI = {
     "restless": "🌀 뒤척임",
     "awake": "👀 각성",
     "unknown": "· 재실 없음",
+    "hold": "⏳ 판정 보류",      # 사람은 있으나 호흡 판단 불가 — '재실 없음'과 구분
 }
 
 with st.sidebar:

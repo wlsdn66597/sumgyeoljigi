@@ -8,6 +8,7 @@ import time
 
 import streamlit as st
 
+import bus
 import topics
 import workers
 from state_store import store
@@ -31,15 +32,32 @@ SLEEP_UI = {
     "hold": "⏳ 판정 보류",      # 사람은 있으나 호흡 판단 불가 — '재실 없음'과 구분
 }
 
+DISTRIBUTED = os.getenv("NUNI_DASHBOARD_ONLY") == "1"
+
 with st.sidebar:
-    st.header("데모 시나리오")
-    if st.button("👶 울음 발생", use_container_width=True):
-        store.set_inject("cry", 8)
-    if st.button("⚠️ 무호흡 이벤트", use_container_width=True):
-        store.set_inject("apnea", 8)
-    if st.button("✅ 정상 복귀", use_container_width=True):
-        store.clear_inject()
-    st.caption("실물 센서 없이 시나리오를 재현합니다. (시뮬레이션)")
+    if DISTRIBUTED:
+        # 실물 모드에서는 시나리오 '주입'이 의미가 없다. 판단은 별도 프로세스(nuni-edge)가
+        # 실제 센서 값으로 하므로, 대시보드 프로세스의 주입 플래그는 아무 영향도 주지 못한다.
+        # 대신 실물 데모의 자극원인 인형 호흡 시뮬레이터(서보)를 MQTT로 제어한다.
+        st.header("실물 데모 제어")
+        st.caption("인형 호흡 시뮬레이터(서보)를 조작해 레이더 반응을 확인합니다.")
+        bpm = st.slider("호흡수(회/분)", 20, 60, 40, help="영아 정상 범위는 30~60회/분")
+        if st.button("▶ 호흡수 적용", use_container_width=True):
+            bus.publish("demo/breath", {"bpm": float(bpm)})
+            st.toast(f"시뮬레이터 {bpm}회/분")
+        if st.button("⚠️ 무호흡 주입 (10초)", use_container_width=True):
+            bus.publish("demo/breath", {"apnea_s": 10})
+            st.toast("서보 정지 — 무호흡 모사")
+        st.caption("※ `breath-sim` 서비스가 실행 중일 때 동작합니다.")
+    else:
+        st.header("데모 시나리오")
+        if st.button("👶 울음 발생", use_container_width=True):
+            store.set_inject("cry", 8)
+        if st.button("⚠️ 무호흡 이벤트", use_container_width=True):
+            store.set_inject("apnea", 8)
+        if st.button("✅ 정상 복귀", use_container_width=True):
+            store.clear_inject()
+        st.caption("실물 센서 없이 시나리오를 재현합니다. (시뮬레이션)")
 
 st.title("NUNI · 비접촉 영유아 케어 모니터")
 holder = st.empty()
@@ -68,6 +86,14 @@ while True:
 
         ss = snap["sleep_state"]
         st.markdown(f"### 수면 상태: {SLEEP_UI.get(ss['state'], ss['state'])}")
+        if ss.get("reason"):
+            st.caption(ss["reason"])
+
+        # 지금 화면의 값이 실물 센서에서 온 것인지 표시(데모 신뢰성)
+        src = "실물 레이더(MR60BHA2)" if r.get("source") == "mr60bha2" else "시뮬레이션"
+        st.caption(f"레이더 소스: {src}"
+                   + (f" · 거리 {r['distance']}cm" if r.get("distance") is not None else "")
+                   + (f" · 심박 {r['heart_rate']}bpm" if r.get("heart_rate") else ""))
         p = snap.get("personal", {})
         if p.get("bpm_normal_range"):
             st.caption(f"개인화 정상 호흡 범위 {p['bpm_normal_range']} 회/분 (학습 표본 {p.get('samples')})")

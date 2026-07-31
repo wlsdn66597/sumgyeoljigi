@@ -37,18 +37,25 @@ DISTRIBUTED = os.getenv("NUNI_DASHBOARD_ONLY") == "1"
 with st.sidebar:
     if DISTRIBUTED:
         # 실물 모드에서는 시나리오 '주입'이 의미가 없다. 판단은 별도 프로세스(nuni-edge)가
-        # 실제 센서 값으로 하므로, 대시보드 프로세스의 주입 플래그는 아무 영향도 주지 못한다.
-        # 대신 실물 데모의 자극원인 인형 호흡 시뮬레이터(서보)를 MQTT로 제어한다.
-        st.header("실물 데모 제어")
-        st.caption("인형 호흡 시뮬레이터(서보)를 조작해 레이더 반응을 확인합니다.")
-        bpm = st.slider("호흡수(회/분)", 20, 60, 40, help="영아 정상 범위는 30~60회/분")
-        if st.button("▶ 호흡수 적용", use_container_width=True):
-            bus.publish("demo/breath", {"bpm": float(bpm)})
-            st.toast(f"시뮬레이터 {bpm}회/분")
-        if st.button("⚠️ 무호흡 주입 (10초)", use_container_width=True):
-            bus.publish("demo/breath", {"apnea_s": 10})
-            st.toast("서보 정지 — 무호흡 모사")
-        st.caption("※ `breath-sim` 서비스가 실행 중일 때 동작합니다.")
+        # 실제 센서 값으로 하므로, 대시보드 프로세스의 주입 플래그는 전달되지 않는다.
+        # 자극은 소프트웨어가 아니라 물리적으로 준다(숨쉬는 인형·소리·입김).
+        st.header("실물 데모")
+        st.caption("모든 값이 실제 센서에서 옵니다. 자극은 물리적으로 줍니다.")
+        st.markdown(
+            "**호흡** — 숨쉬는 인형을 레이더 **정면 0.5~1m**, 가슴이 센서를 향하게\n\n"
+            "**무호흡** — 인형 호흡을 멈추거나 센서 범위 밖으로\n\n"
+            "**울음** — 울음소리 재생 (마이크 근처)\n\n"
+            "**환경** — 센서에 입김 → CO₂ 상승 → 환기 권고"
+        )
+        with st.expander("서보 시뮬레이터 제어 (사용 시)"):
+            st.caption("`breath-sim` 서비스 실행 중일 때만 동작합니다.")
+            bpm = st.slider("호흡수(회/분)", 20, 60, 40, help="영아 정상 범위 30~60")
+            if st.button("▶ 호흡수 적용", use_container_width=True):
+                bus.publish("demo/breath", {"bpm": float(bpm)})
+                st.toast(f"시뮬레이터 {bpm}회/분")
+            if st.button("⚠️ 무호흡 주입 (10초)", use_container_width=True):
+                bus.publish("demo/breath", {"apnea_s": 10})
+                st.toast("서보 정지 — 무호흡 모사")
     else:
         st.header("데모 시나리오")
         if st.button("👶 울음 발생", use_container_width=True):

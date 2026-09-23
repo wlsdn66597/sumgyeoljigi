@@ -1,42 +1,65 @@
-"""학습된 울음 분류기 추론 + 마이크 캡처.
+"""학습된 울음 이유 분류기 추론 + 마이크 캡처.
 
-- CryModel: 울음 감지(cry_score) + 이유 분류(reason, conf)
+- CryModel: 울음 감지(cry_score) + 이유 3클래스(reason, conf)
+    reason: hungry / sleepy / discomfort
+            none      — 울음 점수가 낮아 이유를 따지지 않음
+            uncertain — 울음은 맞지만 최고 확률 < conf_min (판정 보류)
 - Mic:      sounddevice 링버퍼로 최근 N초 파형 반환
+
+학습과 같은 단위로 판정한다: 파형 → YAMNet 프레임 → 연속 SEG_FRAMES 평균 세그먼트
+→ 헤드 확률 → 세그먼트 평균. 1.5초 창이면 세그먼트 1개다.
 """
-import os
 import json
+import os
 import threading
+
 import numpy as np
 
+import config
 import features
 
-SR = 16000
+SR = config.SR
 
 
 class CryModel:
-    def __init__(self, head, labels):
+    def __init__(self, head, labels, meta=None):
         self.head = head
         self.labels = labels
+        meta = meta or {}
+        self.seg_frames = meta.get("seg_frames", config.SEG_FRAMES)
+        self.cry_min = meta.get("cry_min", config.CRY_MIN)
+        self.conf_min = meta.get("conf_min", config.CONF_MIN)
 
     @classmethod
-    def load(cls, art_dir):
+    def load(cls, art_dir=config.ARTIFACTS):
         import tensorflow as tf
         head = tf.keras.models.load_model(os.path.join(art_dir, "cry_head.keras"))
         labels = json.load(open(os.path.join(art_dir, "labels.json"), encoding="utf-8"))
-        return cls(head, labels)
+        meta_path = os.path.join(art_dir, "meta.json")
+        meta = json.load(open(meta_path, encoding="utf-8")) if os.path.exists(meta_path) else None
+        return cls(head, labels, meta)
+
+    def probs(self, wav16k):
+        """→ (cry_score, 클래스 확률[n_cls] 또는 None(울음 세그먼트 없음))"""
+        cry, emb = features.frames(wav16k)
+        cry_score = float(cry.mean()) if len(cry) else 0.0
+        X, _ = features.segments(cry, emb, seg=self.seg_frames, cry_min=self.cry_min)
+        if not len(X):
+            return cry_score, None
+        return cry_score, self.head(X).numpy().mean(axis=0)
 
     def predict(self, wav16k):
         """→ (cry_score, reason, confidence)"""
-        cry_score, emb = features.analyze(wav16k)
-        probs = self.head(emb[None, :]).numpy()[0]
-        i = int(probs.argmax())
-        return cry_score, self.labels[i], float(probs[i])
+        cry_score, p = self.probs(wav16k)
+        if p is None:
+            return cry_score, "none", 0.0
+        i = int(p.argmax())
+        conf = float(p[i])
+        return cry_score, (self.labels[i] if conf >= self.conf_min else "uncertain"), conf
 
     def predict_file(self, path):
         """wav 파일 분류 (마이크 없이 데모·테스트용)."""
-        import librosa
-        w, _ = librosa.load(path, sr=SR, mono=True)
-        return self.predict(w)
+        return self.predict(features.load_wav(path))
 
 
 class Mic:
@@ -76,12 +99,18 @@ class Mic:
 
 
 if __name__ == "__main__":
+    import sys
     import time
-    m = Mic(); m.start()
-    model = CryModel.load("artifacts")
+    model = CryModel.load()
+    if len(sys.argv) > 1:                       # python infer.py a.wav b.wav ...
+        for p in sys.argv[1:]:
+            s, reason, conf = model.predict_file(p)
+            print(f"{p}: cry_score={s:.2f} reason={reason}({conf:.2f})")
+        sys.exit(0)
+    m = Mic()
+    m.start()
     print("마이크 추론 시작 (Ctrl+C 종료)")
     while True:
         cry_score, reason, conf = model.predict(m.get_last(1.5))
-        crying = cry_score > 0.5
-        print(f"cry_score={cry_score:.2f} crying={crying} reason={reason}({conf:.2f})")
+        print(f"cry_score={cry_score:.2f} reason={reason}({conf:.2f})")
         time.sleep(1)

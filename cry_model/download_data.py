@@ -1,79 +1,80 @@
-"""데이터 자동 준비 (best-effort).
+"""데이터 자동 준비 (best-effort). 모두 DATA_ROOT(환경변수 NUNI_CRY_DATA) 아래에 받는다.
 
-  python download_data.py cry     # Donate-a-Cry 울음 데이터 -> data/
-  python download_data.py noise   # ESC-50 소음 -> noise/ (증강용)
+  python download_data.py cry     # Donate-a-Cry (정제본 + 원본 업로드 버킷, ~100MB, ODbL)
+  python download_data.py noise   # ESC-50 (~600MB, CC BY-NC) — 증강 시 crying_baby는 자동 제외
+  python download_data.py rir     # OpenSLR 28 룸 임펄스 응답·배경소음 (~1.3GB, Apache 2.0)
+  python download_data.py all
 
-네트워크/환경에 따라 실패할 수 있으며, 그 경우 아래 수동 안내를 따르면 된다.
+로그인·약관 동의가 필요한 데이터는 직접 받아 extra/<출처명>/ 에 풀면 된다(아래 안내).
 """
 import os
-import sys
 import subprocess
-import shutil
-import zipfile
+import sys
 import urllib.request
+import zipfile
 
 import config
 
 DONATE_REPO = "https://github.com/gveres/donateacry-corpus.git"
 ESC50_URL = "https://github.com/karoldvl/ESC-50/archive/master.zip"
+RIR_URL = "https://www.openslr.org/resources/28/rirs_noises.zip"
+
+
+def _fetch_zip(url, marker):
+    if os.path.isdir(os.path.join(config.DATA_ROOT, marker)):
+        print(f"이미 있음 → {marker}/")
+        return
+    os.makedirs(config.DATA_ROOT, exist_ok=True)
+    zpath = os.path.join(config.DATA_ROOT, os.path.basename(url))
+    print(f"내려받는 중: {url}")
+    urllib.request.urlretrieve(url, zpath)
+    with zipfile.ZipFile(zpath) as z:
+        z.extractall(config.DATA_ROOT)
+    os.remove(zpath)
+    print(f"완료 → {marker}/")
 
 
 def get_cry():
-    tmp = os.path.join(config.BASE, "_donateacry")
-    if not os.path.isdir(tmp):
-        print("git clone donateacry-corpus ...")
-        subprocess.run(["git", "clone", "--depth", "1", DONATE_REPO, tmp], check=True)
-    # cleaned 데이터 폴더 탐색 (라벨별 하위폴더 구조)
-    src = None
-    for root, dirs, _ in os.walk(tmp):
-        if any(d in dirs for d in ["hungry", "tired", "belly_pain", "discomfort", "burping"]):
-            src = root
-            break
-    if not src:
-        raise SystemExit("라벨 폴더를 찾지 못했습니다. 저장소 구조를 확인하세요.")
+    dst = os.path.join(config.DATA_ROOT, "donateacry-corpus")
+    if os.path.isdir(dst):
+        print("이미 있음 → donateacry-corpus/")
+        return
     os.makedirs(config.DATA_ROOT, exist_ok=True)
-    for label in os.listdir(src):
-        sp = os.path.join(src, label)
-        if os.path.isdir(sp):
-            shutil.copytree(sp, os.path.join(config.DATA_ROOT, label), dirs_exist_ok=True)
-    print("완료 → data/  (python prepare_data.py data 로 확인)")
+    subprocess.run(["git", "clone", "--depth", "1", DONATE_REPO, dst], check=True)
+    print("완료 → donateacry-corpus/  (python prepare_data.py 로 매니페스트 생성)")
 
 
 def get_noise():
-    os.makedirs(config.NOISE_DIR, exist_ok=True)
-    zpath = os.path.join(config.BASE, "esc50.zip")
-    print("ESC-50 내려받는 중 (약 600MB)...")
-    urllib.request.urlretrieve(ESC50_URL, zpath)
-    with zipfile.ZipFile(zpath) as z:
-        z.extractall(config.BASE)
-    audio = os.path.join(config.BASE, "ESC-50-master", "audio")
-    for f in os.listdir(audio):
-        shutil.copy(os.path.join(audio, f), config.NOISE_DIR)
-    print("완료 → noise/  (증강에 자동 사용됨)")
+    _fetch_zip(ESC50_URL, "ESC-50-master")
 
 
-HELP = """
-[수동 안내]
-울음 데이터 (Donate-a-Cry):
-  1) https://github.com/gveres/donateacry-corpus 다운로드
-  2) cleaned 폴더의 라벨별 하위폴더(hungry/ tired/ ...)를 cry_model/data/ 로 복사
+def get_rir():
+    _fetch_zip(RIR_URL, "RIRS_NOISES")
 
-증강용 소음 (선택, ESC-50):
-  https://github.com/karoldvl/ESC-50 의 audio/*.wav 를 cry_model/noise/ 로 복사
 
-추가 울음 데이터(권장, 표본 보강):
-  Kaggle 'Infant Cry Audio Corpus' 등 검색해 같은 라벨 폴더 구조로 합치기
+HELP = f"""
+[데이터 위치] {config.DATA_ROOT}   (환경변수 NUNI_CRY_DATA로 변경)
+
+[직접 받아야 하는 데이터 — 로그인/약관 동의 필요]
+  Kaggle 'Baby Cry Pattern Archive (Cry Sense)'  kaggle.com/datasets/mennaahmed23/baby-cry
+  Kaggle 'Infant cry Dataset'                    kaggle.com/datasets/sanmithasadhish/infant-cry-dataset
+  → zip을 받아 extra/<출처명>/ 에 풀기 (예: extra/crysense/, extra/infantcry/)
+    라벨은 파일의 상위 폴더명으로 읽고(config.LABEL_MAP), Donate-a-Cry 재포장본은
+    prepare_data.py가 파일명·해시로, train.py가 임베딩 유사도로 중복을 걸러낸다.
+
+[원본 버킷 변환] .3gp/.caf 는 ffmpeg가 필요하다 (PATH 또는 NUNI_FFMPEG).
 """
 
 if __name__ == "__main__":
     what = sys.argv[1] if len(sys.argv) > 1 else ""
-    try:
-        if what == "cry":
-            get_cry()
-        elif what == "noise":
-            get_noise()
-        else:
-            print(HELP)
-    except Exception as e:
-        print(f"[자동 다운로드 실패] {e}")
+    steps = {"cry": [get_cry], "noise": [get_noise], "rir": [get_rir],
+             "all": [get_cry, get_noise, get_rir]}.get(what)
+    if not steps:
         print(HELP)
+        sys.exit(0)
+    for step in steps:
+        try:
+            step()
+        except Exception as e:
+            print(f"[자동 다운로드 실패] {step.__name__}: {e}")
+    print(HELP)

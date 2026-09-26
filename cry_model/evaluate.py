@@ -30,8 +30,8 @@ def main():
     for folder in sorted(os.listdir(args.root)):
         label = config.LABEL_MAP.get(folder.lower())
         d = os.path.join(args.root, folder)
-        if label is None or not os.path.isdir(d):
-            continue
+        if label is None or label not in lab2i or not os.path.isdir(d):
+            continue            # 모델이 학습하지 않은 클래스(예: 2클래스 모델의 sleepy)는 제외
         for f in sorted(os.listdir(d)):
             if not f.lower().endswith(".wav"):
                 continue

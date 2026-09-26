@@ -1,7 +1,11 @@
-"""울음 '이유' 3클래스 분류 헤드 학습 (YAMNet 임베딩 전이학습) + 교차검증.
+"""울음 '이유' 분류 헤드 학습 (YAMNet 임베딩 전이학습) + 교차검증.
 
     python prepare_data.py                 # 먼저 manifest.csv 생성
-    python train.py [--aug 2] [--no-pitch] [--folds 5] [--holdout-source crysense]
+    python train.py [--min-clips 50 | --classes hungry,discomfort] [--aug 2] [--no-pitch]
+                    [--folds 5] [--conf-min 0.7] [--holdout-source crysense]
+
+클래스 선택: 울음 세그먼트가 있는 클립이 --min-clips 이상인 클래스만 학습한다(데이터가
+부족한 클래스를 억지로 넣으면 그 클래스 recall이 0에 가깝고 전체 판단만 흐려진다).
 
 평가 방식 (이전 버전의 문제를 고친 부분)
   - StratifiedGroupKFold 5겹: 같은 아기는 한 fold에만, 소수 클래스도 모든 fold에 등장.
@@ -10,7 +14,9 @@
     라벨순 정렬 배열의 마지막 10%를 떼어 'tired'가 통째로 학습에서 빠졌다)
   - 기준선 2개와 비교: 최빈 클래스, 로지스틱 회귀.
   - 세그먼트 단위(1.5초, 실시간 추론과 동일)와 클립 단위(세그먼트 확률 평균) 모두 보고.
-  - 판정 보류: 최고 확률 < CONF_MIN 이면 보류 → 커버리지와 보류 제외 정확도를 함께 보고.
+  - 판정 보류: 최고 확률 < conf_min 이면 보류 → 커버리지와 보류 제외 정확도를 함께 보고.
+    (2클래스는 최고 확률이 항상 0.5 이상이라 기본 0.7, 그 외는 config.CONF_MIN)
+  - 2클래스면 임계값과 무관한 ROC-AUC도 보고.
 
 산출물 (--out, 기본 artifacts/)
   cry_head.keras · cry_head.tflite · labels.json · meta.json
@@ -60,6 +66,24 @@ def load_clips(args):
         print(f"울음 세그먼트 없음(CRY_MIN={config.CRY_MIN})으로 제외: {len(dropped)}개 →",
               dict(dropped.groupby(["source", "label"]).size()))
 
+    counts = df.label.value_counts()
+    if args.classes:
+        classes = [c.strip() for c in args.classes.split(",") if c.strip()]
+        unknown = set(classes) - set(config.CLASSES)
+        if unknown:
+            raise SystemExit(f"알 수 없는 클래스 {sorted(unknown)} (가능: {config.CLASSES})")
+        classes = [c for c in config.CLASSES if c in classes]
+    else:
+        classes = [c for c in config.CLASSES if counts.get(c, 0) >= args.min_clips]
+    print("클래스별 사용 가능 클립:", {c: int(counts.get(c, 0)) for c in config.CLASSES},
+          f"→ 학습 대상 {classes}" + ("" if args.classes else f" ({args.min_clips}개 이상)"))
+    if len(classes) < 2:
+        raise SystemExit("분류할 클래스가 2개 미만입니다. --min-clips를 낮추거나 --classes로 지정하세요.")
+    sel = df.label.isin(classes).to_numpy()
+    clean = [x for x, keep_it in zip(clean, sel) if keep_it]
+    df = df[sel].reset_index(drop=True)
+    hold = hold[hold.label.isin(classes)].reset_index(drop=True)
+
     aug = [[] for _ in range(len(df))]
     if args.aug:
         n_noise, n_rir = len(augment._noise_files()), len(augment._rir_files())
@@ -67,16 +91,17 @@ def load_clips(args):
               f"소음 {n_noise}개 · RIR {n_rir}개{' — 없으면 합성으로 대체' if not (n_noise and n_rir) else ''})...")
         for i, r in df.iterrows():
             for k in range(args.aug):
-                rng = np.random.default_rng([config.SEED, i, k])
+                # 시드를 파일 해시로 정해 클래스 구성이 바뀌어도 같은 파일은 같은 증강을 받는다.
+                rng = np.random.default_rng([config.SEED, int(r.md5[:12], 16), k])
                 # 소음·RIR 파일 구성이 바뀌면 다른 증강이므로 캐시 키에 포함
-                tag = f"aug{k}|seed{config.SEED}|pitch{int(args.pitch)}|n{n_noise}r{n_rir}|{r.md5}"
+                tag = f"aug{k}|seed{config.SEED}|md5rng|pitch{int(args.pitch)}|n{n_noise}r{n_rir}|{r.md5}"
                 cry, emb = features.file_frames(
                     r.path, aug=lambda w: augment.random_augment(w, rng, args.pitch), tag=tag)
                 X, _ = features.segments(cry, emb)
                 if len(X):
                     aug[i].append(X)
     df["group"] = merge_near_duplicates(df, clean, args.dup_sim)
-    return df, clean, aug, hold
+    return df, clean, aug, hold, classes
 
 
 def merge_near_duplicates(df, clean, thr):
@@ -206,17 +231,21 @@ def main():
     ap.add_argument("--folds", type=int, default=config.N_FOLDS)
     ap.add_argument("--holdout-source", default=None, help="이 출처는 CV에서 빼고 최종 모델로만 평가")
     ap.add_argument("--dup-sim", type=float, default=0.995, help="유사 중복 병합 코사인 임계값")
+    ap.add_argument("--min-clips", type=int, default=config.MIN_CLIPS,
+                    help="사용 가능 클립이 이 수 이상인 클래스만 학습 (--classes가 우선)")
+    ap.add_argument("--classes", default=None, help="학습할 클래스 직접 지정 (예: hungry,discomfort)")
+    ap.add_argument("--conf-min", type=float, default=None,
+                    help="판정 보류 임계값 (기본: 2클래스 0.7, 그 외 config.CONF_MIN)")
     args = ap.parse_args()
     set_seed(config.SEED)
 
     from sklearn.metrics import confusion_matrix
     from sklearn.model_selection import StratifiedGroupKFold
 
-    labels = config.CLASSES
+    df, clean, aug, hold, labels = load_clips(args)
     n_cls = len(labels)
     lab2i = {l: i for i, l in enumerate(labels)}
-
-    df, clean, aug, hold = load_clips(args)
+    conf_min = args.conf_min if args.conf_min is not None else (0.7 if n_cls == 2 else config.CONF_MIN)
     y_clip = df.label.map(lab2i).to_numpy()
     groups = df.group.to_numpy()
     print("\n학습 대상 클립:", dict(df.label.value_counts()), "| group", len(set(groups)))
@@ -245,7 +274,11 @@ def main():
              "clip": {"mlp": metrics(yc, Pc.argmax(1), n_cls),
                       "logreg": metrics(yc, Pc_lr.argmax(1), n_cls),
                       "majority": metrics(yc, np.full_like(yc, major), n_cls),
-                      "mlp_selective": selective(yc, Pc, config.CONF_MIN, major)}}
+                      "mlp_selective": selective(yc, Pc, conf_min, major)}}
+        if n_cls == 2:
+            from sklearn.metrics import roc_auc_score
+            r["clip_auc"] = {"mlp": float(roc_auc_score(yc, Pc[:, 1])),
+                             "logreg": float(roc_auc_score(yc, Pc_lr[:, 1]))}
         cm_total += confusion_matrix(yc, Pc.argmax(1), labels=range(n_cls))
         folds.append(r)
         print(f"[fold {f}] clip Macro-F1  MLP {r['clip']['mlp']['macro_f1']:.3f} | "
@@ -253,7 +286,7 @@ def main():
               f"최빈 {r['clip']['majority']['macro_f1']:.3f}  (test {len(ids)} clips)")
 
     summary = summarize(folds)
-    print_summary(summary, labels)
+    print_summary(summary, labels, conf_min)
 
     # 최종 모델: 전체 데이터로 학습 (조기 종료용 group 검증셋만 분리)
     tr_fit, va = inner_val_split(np.arange(len(df)), y_clip, groups, config.SEED)
@@ -261,14 +294,14 @@ def main():
     Xva, yva, _ = stack(va, clean, aug, y_clip, with_aug=False)
     final = fit_mlp(Xtr, ytr, Xva, yva, n_cls)
 
-    holdout = evaluate_holdout(final, hold, labels) if len(hold) else None
+    holdout = evaluate_holdout(final, hold, labels, conf_min) if len(hold) else None
 
     os.makedirs(args.out, exist_ok=True)
     final.save(os.path.join(args.out, "cry_head.keras"))
     export_tflite(final, os.path.join(args.out, "cry_head.tflite"))
     json.dump(labels, open(os.path.join(args.out, "labels.json"), "w"), ensure_ascii=False)
     meta = {"classes": labels, "seg_frames": config.SEG_FRAMES, "cry_min": config.CRY_MIN,
-            "conf_min": config.CONF_MIN, "aug": args.aug, "pitch": args.pitch,
+            "conf_min": conf_min, "aug": args.aug, "pitch": args.pitch,
             "clips": {k: int(v) for k, v in df.label.value_counts().items()},
             "sources": {k: int(v) for k, v in df.source.value_counts().items()}, "seed": config.SEED}
     json.dump(meta, open(os.path.join(args.out, "meta.json"), "w"), ensure_ascii=False, indent=2)
@@ -289,6 +322,10 @@ def summarize(folds):
             out[level][model] = {k: {"mean": float(np.mean(v)), "std": float(np.std(v))}
                                  for k, v in vals.items()}
             out[level][model]["recall_mean"] = rec.mean(axis=0).tolist()
+    if "clip_auc" in folds[0]:
+        out["clip_auc"] = {m: {"mean": float(np.mean([f["clip_auc"][m] for f in folds])),
+                               "std": float(np.std([f["clip_auc"][m] for f in folds]))}
+                           for m in ("mlp", "logreg")}
     sel = [f["clip"]["mlp_selective"] for f in folds]
     out["clip"]["mlp_selective"] = {
         "coverage": float(np.mean([s["coverage"] for s in sel])),
@@ -297,7 +334,7 @@ def summarize(folds):
     return out
 
 
-def print_summary(s, labels):
+def print_summary(s, labels, conf_min):
     print("\n=== 교차검증 요약 (평균 ± 표준편차) ===")
     for level in ("segment", "clip"):
         for model in ("mlp", "logreg", "majority"):
@@ -305,12 +342,16 @@ def print_summary(s, labels):
             rec = " ".join(f"{l}={v:.2f}" for l, v in zip(labels, m["recall_mean"]))
             print(f"{level:7s} {model:8s} Macro-F1 {m['macro_f1']['mean']:.3f}±{m['macro_f1']['std']:.3f} "
                   f"| BalAcc {m['balanced_acc']['mean']:.3f} | recall {rec}")
+    if "clip_auc" in s:
+        a = s["clip_auc"]
+        print(f"clip    ROC-AUC  MLP {a['mlp']['mean']:.3f}±{a['mlp']['std']:.3f} | "
+              f"LogReg {a['logreg']['mean']:.3f}±{a['logreg']['std']:.3f}  (무작위 = 0.5)")
     sel = s["clip"]["mlp_selective"]
-    print(f"판정 보류(conf<{config.CONF_MIN}) 적용 시: 커버리지 {sel['coverage']:.2f}, "
+    print(f"판정 보류(conf<{conf_min}) 적용 시: 커버리지 {sel['coverage']:.2f}, "
           f"판정한 것의 정확도 {sel['acc_on_covered']:.3f} (같은 구간 최빈 기준선 {sel['majority_acc_on_covered']:.3f})")
 
 
-def evaluate_holdout(model, hold, labels):
+def evaluate_holdout(model, hold, labels, conf_min):
     lab2i = {l: i for i, l in enumerate(labels)}
     ys, ps = [], []
     for _, r in hold.iterrows():
@@ -323,7 +364,7 @@ def evaluate_holdout(model, hold, labels):
         return None
     ys, ps = np.array(ys), np.stack(ps)
     res = {"clips": int(len(ys)), "clip": metrics(ys, ps.argmax(1), len(labels)),
-           "selective": selective(ys, ps, config.CONF_MIN, int(np.bincount(ys).argmax()))}
+           "selective": selective(ys, ps, conf_min, int(np.bincount(ys).argmax()))}
     print(f"\n[holdout] {len(ys)} clips  Macro-F1 {res['clip']['macro_f1']:.3f}")
     return res
 
@@ -356,7 +397,7 @@ def save_cm(cm, labels, path):
 
 
 def write_report(s, cm, labels, meta, holdout, path):
-    L = ["# 울음 이유 3클래스 분류 — 교차검증 결과", "",
+    L = [f"# 울음 이유 {len(labels)}클래스 분류 — 교차검증 결과", "",
          f"- 클래스: {', '.join(labels)}",
          f"- 클립 수: {meta['clips']}",
          f"- 출처: {meta['sources']}",
@@ -371,8 +412,12 @@ def write_report(s, cm, labels, meta, holdout, path):
             L.append(f"| {level} | {model} | {m['macro_f1']['mean']:.3f} ± {m['macro_f1']['std']:.3f} | "
                      f"{m['balanced_acc']['mean']:.3f} | {m['acc']['mean']:.3f} | "
                      + " | ".join(f"{v:.2f}" for v in m["recall_mean"]) + " |")
+    if "clip_auc" in s:
+        a = s["clip_auc"]
+        L += ["", f"클립 단위 ROC-AUC: MLP {a['mlp']['mean']:.3f} ± {a['mlp']['std']:.3f}, "
+                  f"로지스틱 회귀 {a['logreg']['mean']:.3f} ± {a['logreg']['std']:.3f} (무작위 = 0.5)"]
     sel = s["clip"]["mlp_selective"]
-    L += ["", f"판정 보류(최고 확률 < {config.CONF_MIN}) 적용 시 커버리지 {sel['coverage']:.2f}, "
+    L += ["", f"판정 보류(최고 확률 < {meta['conf_min']}) 적용 시 커버리지 {sel['coverage']:.2f}, "
               f"판정한 것의 정확도 {sel['acc_on_covered']:.3f} "
               f"(같은 구간을 전부 최빈 클래스로 찍을 때 {sel['majority_acc_on_covered']:.3f})", "",
           "혼동행렬 (클립 단위, MLP, 전 fold 합산; 행=정답, 열=예측)", "",

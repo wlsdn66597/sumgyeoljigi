@@ -89,6 +89,21 @@ def file_frames(path, aug=None, tag=""):
     return cry, emb
 
 
+def file_scores(path):
+    """파일의 YAMNet 전체 클래스 점수[T,521](float16)와 평균 임베딩[1024]을 캐시와 함께 반환.
+    소리 종류 분류(sound_events) 평가용."""
+    cached = _cache_path(path, "scores")
+    if os.path.exists(cached):
+        z = np.load(cached)
+        return z["scores"].astype(np.float32), z["emb_mean"]
+    y, _ = load_yamnet()
+    scores, emb, _ = y(load_wav(path).astype(np.float32))
+    scores = scores.numpy().astype(np.float16)
+    emb_mean = emb.numpy().mean(axis=0).astype(np.float32)
+    np.savez(cached, scores=scores, emb_mean=emb_mean)
+    return scores.astype(np.float32), emb_mean
+
+
 # --- 하위 호환 (기존 코드용) ------------------------------------------------
 def analyze(wav16k):
     """16kHz 모노 파형 → (울음 점수, 평균 임베딩 1024-d)."""

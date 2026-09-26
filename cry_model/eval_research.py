@@ -2,6 +2,7 @@
 
     python eval_research.py enes    # EnesBabyCries: 가정 1~4m 녹음 울음 감지율 + 원인 분류
     python eval_research.py pain    # Corvin: 통증(예방접종) vs 불편(목욕) + 녹음 장소 지름길 점검
+    python eval_research.py extra   # Enes 추가 실험: 깨끗한 라벨, 배고픔 vs 나머지, 리듬·맥락 특징
 
 데이터 (DATA_ROOT/research/)
   enes/00_pooled_separate/  Lockhart-Bouron 외 2023, OSF ru7na. 아기 24명의 가정 녹음을
@@ -302,8 +303,135 @@ def run_pain():
     print("\n" + report)
 
 
+# --- Enes 추가 실험 -----------------------------------------------------------
+def enes_timing():
+    """파일 이름의 구간(ms)만으로 긴 울음별 리듬 특징과 시작 시각을 만든다(오디오 불필요)."""
+    groups = collections.defaultdict(list)
+    for n in os.listdir(ENES_DIR):
+        p = n[:-4].split("_")
+        if len(p) != 8 or "-" not in p[7]:
+            continue
+        a, b = p[7].split("-")
+        groups["_".join(p[:7])].append((int(a), int(b)))
+    feats = {}
+    for key, segs in groups.items():
+        segs.sort()
+        st = np.array([a for a, _ in segs], float)
+        en = np.array([b for _, b in segs], float)
+        dur = (en - st) / 1000
+        gaps = np.clip((st[1:] - en[:-1]) / 1000, 0, None)
+        span = max((en.max() - st.min()) / 1000, 1e-3)
+        p = key.split("_")
+        t = pd.to_datetime(p[5] + p[6], format="%d%m%Y%H%M", errors="coerce")
+        feats[key] = {"n_syl": len(segs), "syl_med": float(np.median(dur)),
+                      "syl_iqr": float(np.subtract(*np.percentile(dur, [75, 25]))),
+                      "gap_med": float(np.median(gaps)) if len(gaps) else 0.0,
+                      "voiced_ratio": float(dur.sum() / span), "span": float(span),
+                      "rate": float(len(segs) / span), "time": t}
+    return feats
+
+
+def context_features(bouts, timing, cap_h=12.0):
+    """맥락 특징: 시간대, 나이, 같은 아기의 직전 울음·직전 배고픔 울음 이후 경과 시간, 직전 원인.
+    직전 울음의 원인은 실제 사용에서 부모 피드백으로 알 수 있는 정보다."""
+    rows = {}
+    by_baby = collections.defaultdict(list)
+    for it in bouts:
+        by_baby[it["baby"]].append(it)
+    for b, its in by_baby.items():
+        its = sorted(its, key=lambda it: (timing[it["key"]]["time"] if pd.notna(timing[it["key"]]["time"])
+                                          else pd.Timestamp.min))
+        last_t, last_hunger_t, last_cause = None, None, "none"
+        for it in its:
+            t = timing[it["key"]]["time"]
+            h = t.hour + t.minute / 60 if pd.notna(t) else 12.0
+            def since(prev):
+                if prev is None or pd.isna(t):
+                    return cap_h
+                return float(min(max((t - prev).total_seconds() / 3600, 0), cap_h))
+            rows[it["key"]] = {"hour_sin": np.sin(2 * np.pi * h / 24), "hour_cos": np.cos(2 * np.pi * h / 24),
+                               "age": it["age"], "h_since_prev": since(last_t),
+                               "h_since_hunger": since(last_hunger_t),
+                               **{f"prev_{c}": float(last_cause == c) for c in CAUSES3}}
+            if pd.notna(t):
+                last_t = t
+                if it["cause"] == "hunger":
+                    last_hunger_t = t
+            last_cause = it["cause"]
+    return rows
+
+
+def leave_baby_out_tab(X, y, babies, n_cls):
+    from sklearn.ensemble import RandomForestClassifier
+    P = np.zeros((len(y), n_cls))
+    for b in np.unique(babies):
+        te, tr = babies == b, babies != b
+        m = RandomForestClassifier(n_estimators=300, min_samples_leaf=3, class_weight="balanced",
+                                   random_state=config.SEED, n_jobs=-1).fit(X[tr], y[tr])
+        P[np.ix_(te, m.classes_)] = m.predict_proba(X[te])
+    return P
+
+
+def run_extra():
+    from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+    bouts = enes_bouts()
+    timing = enes_timing()
+    ctx = context_features(bouts, timing)
+    items = [it for it in bouts if it["cause"] in CAUSES3]
+    Xs, keep = [], []
+    for i, it in enumerate(items):
+        X, _ = seg_of(it, cap=MAX_SEG_PER_ITEM)
+        if len(X):
+            Xs.append(X)
+            keep.append(i)
+    items = [items[i] for i in keep]
+    y = np.array([CAUSES3.index(it["cause"]) for it in items])
+    babies = np.array([it["baby"] for it in items])
+    L = ["# EnesBabyCries 추가 실험", "",
+         f"- 울음 {len(items)}개, 아기 {len(set(babies))}명, 모두 한 아기씩 빼고 학습(leave-one-baby-out)",
+         "- 3분류는 균형 정확도(무작위 0.333), 배고픔 vs 나머지는 ROC-AUC(무작위 0.5)", ""]
+
+    # A) 깨끗한 라벨: 부모 판단 == 울음을 멈춘 행동
+    clean = np.array([it["cause_parent"] == it["cause"] for it in items])
+    P_all = leave_baby_out(items, y, Xs, 3)
+    ci = np.where(clean)[0]
+    P_clean = leave_baby_out([items[i] for i in ci], y[ci], [Xs[i] for i in ci], 3)
+    L += ["## A. 라벨 잡음 줄이기 (부모 판단과 멈춘 행동이 일치한 울음만)", "",
+          "| 데이터 | 울음 수 | 균형 정확도 |", "|---|---:|---:|",
+          f"| 전체 | {len(y)} | {balanced_accuracy_score(y, P_all.argmax(1)):.3f} |",
+          f"| 라벨 일치만 | {len(ci)} | {balanced_accuracy_score(y[ci], P_clean.argmax(1)):.3f} |", ""]
+
+    # B) 배고픔 vs 나머지
+    yh = (y == CAUSES3.index("hunger")).astype(int)
+
+    # C) 리듬·맥락 특징
+    rkeys = ["n_syl", "syl_med", "syl_iqr", "gap_med", "voiced_ratio", "span", "rate"]
+    ckeys = ["hour_sin", "hour_cos", "age", "h_since_prev", "h_since_hunger"] + [f"prev_{c}" for c in CAUSES3]
+    R = np.array([[timing[it["key"]][k] for k in rkeys] for it in items], float)
+    C = np.array([[ctx[it["key"]][k] for k in ckeys] for it in items], float)
+    A = np.stack([X.mean(axis=0) for X in Xs])            # 소리: 울음 단위 평균 임베딩
+    from sklearn.decomposition import PCA
+    A20 = PCA(n_components=20, random_state=config.SEED).fit_transform(A)
+    sets = {"소리 (YAMNet, 로지스틱 회귀)": None, "리듬 (음절 길이·간격·속도)": R, "맥락 (시간대·경과 시간·직전 원인)": C,
+            "리듬 + 맥락": np.hstack([R, C]), "소리(PCA 20) + 리듬 + 맥락": np.hstack([A20, R, C])}
+    L += ["## B·C. 특징별 비교", "", "| 특징 | 3분류 균형 정확도 | 배고픔 vs 나머지 AUC |", "|---|---:|---:|"]
+    for name, X in sets.items():
+        if X is None:
+            P = P_all
+        else:
+            P = leave_baby_out_tab(X, y, babies, 3)
+        L.append(f"| {name} | {balanced_accuracy_score(y, P.argmax(1)):.3f} | "
+                 f"{roc_auc_score(yh, P[:, CAUSES3.index('hunger')]):.3f} |")
+    L += ["", "맥락 특징의 '직전 원인'은 실제 사용에서 부모 피드백으로 얻는 정보다.",
+          "시각은 녹음 파일의 시작 시각이라 울음 발생 시각과 약간 다를 수 있다.", ""]
+    report = "\n".join(L) + "\n"
+    os.makedirs(OUT, exist_ok=True)
+    open(os.path.join(OUT, "ENES_EXTRA_REPORT.md"), "w", encoding="utf-8").write(report)
+    print("\n" + report)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("what", choices=["enes", "pain"])
+    ap.add_argument("what", choices=["enes", "pain", "extra"])
     args = ap.parse_args()
-    run_enes() if args.what == "enes" else run_pain()
+    {"enes": run_enes, "pain": run_pain, "extra": run_extra}[args.what]()

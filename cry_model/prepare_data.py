@@ -67,12 +67,20 @@ def _walk_audio(root):
                 yield os.path.join(d, f)
 
 
+# 이유 라벨이 없는 일반 폴더명. 다른 출처에서 이 폴더에 있는 파일과 내용이 똑같은데
+# 이유 라벨이 붙어 있으면, 그 이유 라벨은 근거가 없다고 보고 제외한다.
+# (실측: Kaggle Cry Sense의 숫자 이름 파일 532개가 Infant cry Dataset의 'cry' 파일과
+#  바이트 단위로 동일했고, 같은 파일이 여러 이유 폴더에 복사돼 있었다.)
+GENERIC_FOLDERS = {"cry", "not_cry", "crying", "non_cry", "laugh", "noise", "silence"}
+
+
 class Builder:
-    def __init__(self):
+    def __init__(self, generic_md5=None):
         self.rows, self.keys, self.md5s = [], set(), set()
+        self.generic_md5 = generic_md5 or set()
         self.skipped = Counter()
 
-    def add(self, path, orig_label, source, group, key=None):
+    def add(self, path, orig_label, source, group, key=None, check_generic=False):
         label = config.LABEL_MAP.get(orig_label)
         if label is None:
             self.skipped[f"라벨 제외({orig_label})"] += 1
@@ -81,6 +89,9 @@ class Builder:
             self.skipped["중복(파일명 키)"] += 1
             return
         digest = md5_file(path)
+        if check_generic and digest in self.generic_md5:   # 라벨 원출처(Donate-a-Cry)에는 적용 안 함
+            self.skipped["근거 없는 이유 라벨(일반 울음 파일과 동일)"] += 1
+            return
         if digest in self.md5s:
             self.skipped["중복(파일 해시)"] += 1
             return
@@ -135,14 +146,24 @@ def add_extra(b, extra_dir):
             m = DAC_RE.match(os.path.basename(p))
             if m:   # Donate-a-Cry 재포장본이면 같은 키·같은 아기 group으로 취급
                 b.add(p, folder, src, "dac:" + m["uuid"].lower(),
-                      key="dac:" + m["uuid"].lower() + "-" + m["ts"])
+                      key="dac:" + m["uuid"].lower() + "-" + m["ts"], check_generic=True)
             else:   # 출처 불명 파일: 아기 식별 불가 → 파일 단위 group (유사도 병합은 train.py)
-                b.add(p, folder, src, f"{src}:{os.path.relpath(p, sroot)}")
+                b.add(p, folder, src, f"{src}:{os.path.relpath(p, sroot)}", check_generic=True)
+
+
+def collect_generic_md5(extra_dir):
+    """extra/ 아래 일반 폴더(GENERIC_FOLDERS)에 있는 파일들의 해시."""
+    out = set()
+    if os.path.isdir(extra_dir):
+        for p in _walk_audio(extra_dir):
+            if os.path.basename(os.path.dirname(p)).lower().replace(" ", "_") in GENERIC_FOLDERS:
+                out.add(md5_file(p))
+    return out
 
 
 def build_manifest(root=None):
     root = root or config.DATA_ROOT
-    b = Builder()
+    b = Builder(collect_generic_md5(os.path.join(root, "extra")))
     add_donateacry(b, os.path.join(root, "donateacry-corpus"))
     add_extra(b, os.path.join(root, "extra"))
     df = pd.DataFrame(b.rows)

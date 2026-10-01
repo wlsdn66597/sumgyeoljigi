@@ -581,7 +581,10 @@ def run_baidu():
 def ifpalvd_items():
     root = os.path.join(RES, "ifpalvd")
     lab = pd.read_csv(os.path.join(root, "labels.csv"), sep=";")
-    vids = {os.path.basename(v): v for v in glob.glob(os.path.join(root, "**", "*.avi"), recursive=True)}
+    # 공개 아카이브의 파일명은 인도네시아어 'kasus'(=case)로 시작한다. 라벨은 253개 구간 기준이지만
+    # 공개된 영상은 (아기, 시술 전/후)마다 10초 구간 1개씩 47개뿐이다.
+    vids = {os.path.basename(v).replace("kasus", "case"): v
+            for v in glob.glob(os.path.join(root, "**", "*.avi"), recursive=True)}
     wav_dir = os.path.join(root, "_wav")
     os.makedirs(wav_dir, exist_ok=True)
     out, missing = [], 0
@@ -668,7 +671,8 @@ def run_ifpalvd():
     lbo(pain_cry, lambda it: int(it["pain"] != "No Pain"), lambda it: seg_of(it)[0], "울음 세그먼트")
     L += ["", "## 한계", "",
           "- 통증 라벨은 FLACC 행동 점수라 '울음' 항목이 점수에 들어간다. 그래서 심함/중간 구분은 사실상 울음 격렬도 추정이다.",
-          "- 아기 27명, 울음 클립 약 130개로 작다. 녹음 장소·장비 정보가 없다."]
+          "- 라벨은 253개 구간 기준이지만 공개 영상은 (아기, 시술 전/후)마다 1개씩 47개뿐이다.",
+          "  나머지 구간은 원저자(Yosi Kristian 외)에게 요청해야 한다. 녹음 장소·장비 정보가 없다."]
     _save_report("IFPALVD_REPORT.md", L)
 
 

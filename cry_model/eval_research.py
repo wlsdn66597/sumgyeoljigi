@@ -4,6 +4,8 @@
     python eval_research.py pain    # Corvin: 통증(예방접종) vs 불편(목욕) + 녹음 장소 지름길 점검
     python eval_research.py extra   # Enes 추가 실험: 깨끗한 라벨, 배고픔 vs 나머지, 리듬·맥락 특징
     python eval_research.py online  # 실제 사용 모사: 아기별 원인 이력이 시간순으로 쌓일 때 맥락 + 이력 결합
+    python eval_research.py baidu   # iFLYTEK/Baidu 6클래스로 학습 → EnesBabyCries로 교차 평가(아기 완전 분리)
+    python eval_research.py ifpalvd # IFPaLVD: 같은 환경에서 녹음된 울음의 통증 강도(심함 vs 중간) 구분
 
 데이터 (DATA_ROOT/research/)
   enes/00_pooled_separate/  Lockhart-Bouron 외 2023, OSF ru7na. 아기 24명의 가정 녹음을
@@ -18,6 +20,7 @@ import argparse
 import collections
 import glob
 import os
+import re
 
 import numpy as np
 import pandas as pd
@@ -485,8 +488,200 @@ def run_online():
     print("\n" + report_txt)
 
 
+# --- iFLYTEK/Baidu 6클래스 → EnesBabyCries 교차 평가 ---------------------------------
+BAIDU_MAP = {"hungry": "hunger", "hug": "isolation", "uncomfortable": "discomfort", "diaper": "discomfort"}
+
+
+def baidu_items():
+    files = sorted(glob.glob(os.path.join(RES, "baidu", "**", "train", "*", "*.wav"), recursive=True))
+    out = []
+    for p in files:
+        cry, emb = features.file_frames(p)
+        out.append({"key": p, "label": os.path.basename(os.path.dirname(p)), "cry": cry, "emb": emb})
+    return out
+
+
+def run_baidu():
+    from sklearn.metrics import balanced_accuracy_score, confusion_matrix, roc_auc_score
+    from sklearn.model_selection import StratifiedKFold
+    items = baidu_items()
+    labels6 = sorted(set(it["label"] for it in items))
+    L = ["# iFLYTEK/Baidu 울음 6클래스 → EnesBabyCries 교차 평가", "",
+         f"- Baidu 학습 데이터 {len(items)}개: {dict(collections.Counter(it['label'] for it in items))}",
+         "- 파일명에 아기 정보가 없어서 Baidu 내부 평가는 같은 아기가 학습·평가에 섞일 수 있다(낙관적).", ""]
+
+    # 0) 중복 점검: Baidu 내부, Donate-a-Cry와의 겹침
+    E = np.stack([it["emb"].mean(axis=0) for it in items])
+    En = E / (np.linalg.norm(E, axis=1, keepdims=True) + 1e-9)
+    S = En @ En.T
+    np.fill_diagonal(S, 0)
+    man = pd.read_csv(config.MANIFEST)
+    dac = [features.file_frames(pth)[1].mean(axis=0) for pth in man[man.source == "dac_cleaned"].path]
+    D = np.stack(dac)
+    D = D / (np.linalg.norm(D, axis=1, keepdims=True) + 1e-9)
+    near_dac = int(((En @ D.T).max(axis=1) >= 0.99).sum())
+    L += [f"- 내부 유사 중복(cos≥0.99) 클립: {int((S.max(axis=1) >= 0.99).sum())}개, "
+          f"Donate-a-Cry와 거의 같은 클립: {near_dac}개", ""]
+
+    # 1) Baidu 내부 6클래스 5겹 (아기 정보 없음 → 낙관적)
+    Xs, keep = [], []
+    for i, it in enumerate(items):
+        X, _ = seg_of(it, cry_min=None, cap=MAX_SEG_PER_ITEM)
+        if len(X):
+            Xs.append(X)
+            keep.append(i)
+    items = [items[i] for i in keep]
+    y6 = np.array([labels6.index(it["label"]) for it in items])
+    P6 = np.zeros((len(items), len(labels6)))
+    for tr, te in StratifiedKFold(5, shuffle=True, random_state=config.SEED).split(np.zeros(len(y6)), y6):
+        m = logreg().fit(np.concatenate([Xs[i] for i in tr]), np.concatenate([[y6[i]] * len(Xs[i]) for i in tr]))
+        for i in te:
+            P6[i] = m.predict_proba(Xs[i]).mean(axis=0)
+    L += ["## 1. Baidu 내부 6클래스 (5겹, 아기 분리 불가 → 낙관적)", "",
+          f"균형 정확도 {balanced_accuracy_score(y6, P6.argmax(1)):.3f} (무작위 {1 / len(labels6):.3f})", ""]
+
+    # 2) Baidu(3클래스로 매핑)로 학습 → Enes 평가
+    mi = [i for i, it in enumerate(items) if it["label"] in BAIDU_MAP]
+    yb = np.array([CAUSES3.index(BAIDU_MAP[items[i]["label"]]) for i in mi])
+    Xb = np.concatenate([Xs[i] for i in mi])
+    ybs = np.concatenate([[yb[k]] * len(Xs[i]) for k, i in enumerate(mi)])
+    model = logreg().fit(Xb, ybs)
+    bouts = [it for it in enes_bouts() if it["cause"] in CAUSES3]
+    eX, ey = [], []
+    for it in bouts:
+        X, _ = seg_of(it, cap=MAX_SEG_PER_ITEM)
+        if len(X):
+            eX.append(X)
+            ey.append(CAUSES3.index(it["cause"]))
+    ey = np.array(ey)
+    Pe = np.stack([model.predict_proba(X).mean(axis=0) for X in eX])
+    yh = (ey == CAUSES3.index("hunger")).astype(int)
+    cm = confusion_matrix(ey, Pe.argmax(1), labels=range(3))
+    L += ["## 2. Baidu로 학습 → EnesBabyCries로 평가 (아기·녹음 환경 완전 분리)", "",
+          "매핑: hungry→배고픔, hug→혼자 둠(안아주길 원함), uncomfortable·diaper→불편. awake·sleepy는 대응 클래스가 없어 제외.", "",
+          f"- Enes 울음 {len(ey)}개: 3분류 균형 정확도 **{balanced_accuracy_score(ey, Pe.argmax(1)):.3f}** (무작위 0.333), "
+          f"배고픔 AUC **{roc_auc_score(yh, Pe[:, CAUSES3.index('hunger')]):.3f}** (무작위 0.5)",
+          "", "혼동행렬 (행=Enes 정답, 열=예측; " + ", ".join(CAUSES3) + ")", ""]
+    L += ["    " + " ".join(f"{v:4d}" for v in row) for row in cm]
+
+    # 3) 반대 방향: Enes로 학습 → Baidu 평가
+    m2 = logreg().fit(np.concatenate(eX), np.concatenate([[ey[k]] * len(X) for k, X in enumerate(eX)]))
+    Pb = np.stack([m2.predict_proba(Xs[i]).mean(axis=0) for i in mi])
+    ybh = (yb == CAUSES3.index("hunger")).astype(int)
+    L += ["", "## 3. 반대 방향: Enes로 학습 → Baidu 평가", "",
+          f"- Baidu 클립 {len(mi)}개: 균형 정확도 {balanced_accuracy_score(yb, Pb.argmax(1)):.3f}, "
+          f"배고픔 AUC {roc_auc_score(ybh, Pb[:, CAUSES3.index('hunger')]):.3f}", "",
+          "## 한계", "",
+          "- 두 데이터의 원인 정의가 다르다(Baidu 라벨 기준 불명, Enes는 울음을 멈춘 부모 행동).",
+          "- Baidu 미러의 원 대회 약관이 불분명해 연구 확인용으로만 사용했다."]
+    _save_report("BAIDU_REPORT.md", L)
+
+
+# --- IFPaLVD: 같은 환경에서의 통증 강도 ---------------------------------------------
+def ifpalvd_items():
+    root = os.path.join(RES, "ifpalvd")
+    lab = pd.read_csv(os.path.join(root, "labels.csv"), sep=";")
+    vids = {os.path.basename(v): v for v in glob.glob(os.path.join(root, "**", "*.avi"), recursive=True)}
+    wav_dir = os.path.join(root, "_wav")
+    os.makedirs(wav_dir, exist_ok=True)
+    out, missing = [], 0
+    import subprocess
+    for _, r in lab.iterrows():
+        v = vids.get(r.filename)
+        if v is None:
+            missing += 1
+            continue
+        w = os.path.join(wav_dir, os.path.splitext(r.filename)[0].replace(" ", "_") + ".wav")
+        if not os.path.exists(w):
+            subprocess.run([config.FFMPEG, "-nostdin", "-loglevel", "error", "-y", "-i", v, "-vn",
+                            "-ac", "1", "-ar", str(config.SR), w], capture_output=True)
+        if not os.path.exists(w) or os.path.getsize(w) < 1000:
+            missing += 1
+            continue
+        cry, emb = features.file_frames(w)
+        case = int(re.search(r"case\s*(\d+)", r.filename).group(1))
+        out.append({"key": r.filename, "baby": f"case{case}", "pain": r.pain_level, "cry_label": r.cry_label,
+                    "phase": r.filename.split("_")[1], "wav": w, "cry": cry, "emb": emb})
+    return out, missing
+
+
+def run_ifpalvd():
+    from sklearn.metrics import roc_auc_score, balanced_accuracy_score
+    import soundfile as sf_
+    items, missing = ifpalvd_items()
+    L = ["# IFPaLVD: 통증 강도와 울음 (아기 27명, 시술 전후 영상의 소리)", "",
+         f"- 사용 클립 {len(items)}개 (영상·오디오 없음 {missing}개)",
+         f"- {dict(collections.Counter((it['pain'], it['cry_label']) for it in items))}", ""]
+
+    # 0) 울음 감지 확인: YAMNet 울음 점수로 Cry vs No Cry
+    yc = np.array([it["cry_label"] == "Cry" for it in items]).astype(int)
+    sc = np.array([float(it["cry"].max()) if len(it["cry"]) else 0.0 for it in items])
+    L += [f"## 0. 울음 감지 (YAMNet 최대 울음 점수): Cry vs No Cry AUC {roc_auc_score(yc, sc):.3f}", ""]
+
+    def lbo(sub, yfun, seg_fn, name):
+        its, Xs = [], []
+        for it in sub:
+            X = seg_fn(it)
+            if len(X):
+                its.append(it)
+                Xs.append(X)
+        y = np.array([yfun(it) for it in its])
+        if len(set(y)) < 2 or len(set(it["baby"] for it in its)) < 3:
+            L.append(f"| {name} | {len(its)} | - | - |")
+            return
+        P = leave_baby_out(its, y, Xs, 2)[:, 1]
+        L.append(f"| {name} | {len(its)} ({int(y.sum())}:{int((1 - y).sum())}) | {roc_auc_score(y, P):.3f} | "
+                 f"{balanced_accuracy_score(y, (P >= 0.5).astype(int)):.3f} |")
+
+    def background(it):
+        m = it["cry"] < 0.05
+        return it["emb"][m].mean(axis=0, keepdims=True) if m.sum() >= 1 else np.zeros((0, 1024))
+
+    cry_items = [it for it in items if it["cry_label"] == "Cry" and it["pain"] != "No Pain"]
+    severe = lambda it: int(it["pain"] == "Severe Pain")
+    L += ["## 1. 울고 있는 클립 중 심한 통증 vs 중간 통증 (한 아기씩 빼고 학습)", "",
+          "| 입력 | 클립 (심함:중간) | ROC-AUC | 균형 정확도 |", "|---|---:|---:|---:|"]
+    lbo(cry_items, severe, lambda it: seg_of(it)[0], "울음 세그먼트 (YAMNet 임베딩)")
+    lbo(cry_items, severe, background, "배경만 (울음 점수 0.05 미만)")
+
+    # 단순 기준선: 음량·울음 점수만으로
+    def simple_auc(feat):
+        y = np.array([severe(it) for it in cry_items])
+        v = np.array([feat(it) for it in cry_items])
+        return roc_auc_score(y, v)
+
+    def rms(it):
+        x, _ = sf_.read(it["wav"], dtype="float32")
+        return float(np.sqrt(np.mean(x ** 2)) + 1e-9)
+
+    def cry_ratio(it):
+        return float((it["cry"] >= 0.3).mean()) if len(it["cry"]) else 0.0
+
+    L += ["", "학습 없는 단순 지표 (심함일수록 클 것으로 가정):", "",
+          f"- 음량(RMS) AUC {simple_auc(rms):.3f}",
+          f"- 울음 비율(울음 점수 0.3 이상 프레임 비율) AUC {simple_auc(cry_ratio):.3f}",
+          f"- 최대 울음 점수 AUC {simple_auc(lambda it: float(it['cry'].max()) if len(it['cry']) else 0.0):.3f}", ""]
+
+    pain_cry = [it for it in items if it["cry_label"] == "Cry"]
+    L += ["## 2. 울고 있는 클립 중 통증 있음 vs 없음 (표본 불균형 주의)", "",
+          "| 입력 | 클립 (통증:없음) | ROC-AUC | 균형 정확도 |", "|---|---:|---:|---:|"]
+    lbo(pain_cry, lambda it: int(it["pain"] != "No Pain"), lambda it: seg_of(it)[0], "울음 세그먼트")
+    L += ["", "## 한계", "",
+          "- 통증 라벨은 FLACC 행동 점수라 '울음' 항목이 점수에 들어간다. 그래서 심함/중간 구분은 사실상 울음 격렬도 추정이다.",
+          "- 아기 27명, 울음 클립 약 130개로 작다. 녹음 장소·장비 정보가 없다."]
+    _save_report("IFPALVD_REPORT.md", L)
+
+
+def _save_report(name, L):
+    txt = "\n".join(L) + "\n"
+    os.makedirs(OUT, exist_ok=True)
+    open(os.path.join(OUT, name), "w", encoding="utf-8").write(txt)
+    print("\n" + txt)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("what", choices=["enes", "pain", "extra", "online"])
+    ap.add_argument("what", choices=["enes", "pain", "extra", "online", "baidu", "ifpalvd"])
     args = ap.parse_args()
-    {"enes": run_enes, "pain": run_pain, "extra": run_extra, "online": run_online}[args.what]()
+    {"enes": run_enes, "pain": run_pain, "extra": run_extra, "online": run_online,
+     "baidu": run_baidu, "ifpalvd": run_ifpalvd}[args.what]()

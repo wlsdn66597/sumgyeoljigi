@@ -3,6 +3,7 @@
     python eval_research.py enes    # EnesBabyCries: 가정 1~4m 녹음 울음 감지율 + 원인 분류
     python eval_research.py pain    # Corvin: 통증(예방접종) vs 불편(목욕) + 녹음 장소 지름길 점검
     python eval_research.py extra   # Enes 추가 실험: 깨끗한 라벨, 배고픔 vs 나머지, 리듬·맥락 특징
+    python eval_research.py online  # 실제 사용 모사: 아기별 원인 이력이 시간순으로 쌓일 때 맥락 + 이력 결합
 
 데이터 (DATA_ROOT/research/)
   enes/00_pooled_separate/  Lockhart-Bouron 외 2023, OSF ru7na. 아기 24명의 가정 녹음을
@@ -430,8 +431,62 @@ def run_extra():
     print("\n" + report)
 
 
+# --- 실제 사용 모사: 부모 피드백(원인 이력)이 시간순으로 쌓이는 상황 -------------------
+def run_online():
+    """각 아기의 울음을 시간순으로 보며, 그 시점 이전의 정보만 쓴다.
+    - 일반 맥락 모델: 다른 아기들로 학습한 리듬+맥락 RF (leave-one-baby-out)
+    - 아기 이력: 그 아기의 이전 울음 원인 빈도(부모가 '왜 울었나요?'에 답한 결과에 해당)
+    - 결합: 두 확률을 곱해 정규화
+    """
+    from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+    bouts = [it for it in enes_bouts() if it["cause"] in CAUSES3]
+    timing = enes_timing()
+    ctx = context_features(enes_bouts(), timing)
+    rkeys = ["n_syl", "syl_med", "syl_iqr", "gap_med", "voiced_ratio", "span", "rate"]
+    ckeys = ["hour_sin", "hour_cos", "age", "h_since_prev", "h_since_hunger"] + [f"prev_{c}" for c in CAUSES3]
+    X = np.array([[timing[b["key"]][k] for k in rkeys] + [ctx[b["key"]][k] for k in ckeys] for b in bouts], float)
+    y = np.array([CAUSES3.index(b["cause"]) for b in bouts])
+    babies = np.array([b["baby"] for b in bouts])
+    Pg = leave_baby_out_tab(X, y, babies, 3)
+
+    tkey = lambda b: timing[b["key"]]["time"] if pd.notna(timing[b["key"]]["time"]) else pd.Timestamp.min
+    rows = []
+    for bb in np.unique(babies):
+        idx = sorted(np.where(babies == bb)[0], key=lambda i: tkey(bouts[i]))
+        counts = np.zeros(3)
+        for k, i in enumerate(idx):
+            prior = (counts + 1.0) / (counts.sum() + 3.0)          # 라플라스 평활
+            comb = Pg[i] * prior
+            comb = comb / comb.sum()
+            rows.append({"k": k, "y": y[i], "g": Pg[i], "p": prior, "c": comb})
+            counts[y[i]] += 1                                      # 이 울음 뒤 부모 피드백이 들어온다
+
+    def report(sel, name):
+        yy = np.array([r["y"] for r in sel])
+        yh = (yy == CAUSES3.index("hunger")).astype(int)
+        out = []
+        for key, label in (("g", "일반 맥락 모델"), ("p", "아기 이력만"), ("c", "맥락 + 아기 이력")):
+            P = np.stack([r[key] for r in sel])
+            out.append(f"| {name} | {label} | {len(sel)} | {balanced_accuracy_score(yy, P.argmax(1)):.3f} | "
+                       f"{roc_auc_score(yh, P[:, CAUSES3.index('hunger')]):.3f} |")
+        return out
+
+    L = ["# 실제 사용 모사: 맥락 + 아기별 원인 이력 (EnesBabyCries)", "",
+         "각 아기의 울음을 시간순으로 보며 그 시점 이전 정보만 사용. 아기 이력 = 이전 울음들의 원인 빈도",
+         "(부모 피드백으로 쌓인다고 가정). 일반 맥락 모델은 다른 아기들로만 학습.", "",
+         "| 평가 구간 | 방법 | 울음 수 | 3분류 균형 정확도 | 배고픔 AUC |", "|---|---|---:|---:|---:|"]
+    L += report(rows, "전체")
+    L += report([r for r in rows if r["k"] >= 5], "이력 5개 이상 쌓인 뒤")
+    L += report([r for r in rows if r["k"] >= 10], "이력 10개 이상 쌓인 뒤")
+    L += ["", "무작위: 균형 정확도 0.333, AUC 0.5"]
+    report_txt = "\n".join(L) + "\n"
+    os.makedirs(OUT, exist_ok=True)
+    open(os.path.join(OUT, "ONLINE_REPORT.md"), "w", encoding="utf-8").write(report_txt)
+    print("\n" + report_txt)
+
+
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("what", choices=["enes", "pain", "extra"])
+    ap.add_argument("what", choices=["enes", "pain", "extra", "online"])
     args = ap.parse_args()
-    {"enes": run_enes, "pain": run_pain, "extra": run_extra}[args.what]()
+    {"enes": run_enes, "pain": run_pain, "extra": run_extra, "online": run_online}[args.what]()

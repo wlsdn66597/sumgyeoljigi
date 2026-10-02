@@ -4,6 +4,7 @@
     python eval_research.py pain    # Corvin: 통증(예방접종) vs 불편(목욕) + 녹음 장소 지름길 점검
     python eval_research.py extra   # Enes 추가 실험: 깨끗한 라벨, 배고픔 vs 나머지, 리듬·맥락 특징
     python eval_research.py online  # 실제 사용 모사: 아기별 원인 이력이 시간순으로 쌓일 때 맥락 + 이력 결합
+    python eval_research.py online_audio  # 위 결합에 대형 모델 소리 확률(joint_train.py 아기 분리 예측)을 더함
     python eval_research.py baidu   # iFLYTEK/Baidu 6클래스로 학습 → EnesBabyCries로 교차 평가(아기 완전 분리)
     python eval_research.py ifpalvd # IFPaLVD: 같은 환경에서 녹음된 울음의 통증 강도(심함 vs 중간) 구분
 
@@ -488,6 +489,75 @@ def run_online():
     print("\n" + report_txt)
 
 
+def run_online_audio():
+    """대형 모델 소리 확률을 맥락 + 아기 이력에 더하면 오르는지(실제 사용 모사와 같은 시간순 절차).
+    소리 확률은 joint_train.py가 아기 분리 5겹으로 만든 예측(OOF)이라 평가 아기를 본 적 없는 모델의 출력이다.
+    입력: OUT/enes_audio_oof.csv (key, stage, model, cond, hunger, discomfort, isolation)"""
+    from sklearn.metrics import balanced_accuracy_score, roc_auc_score
+    A = pd.read_csv(os.path.join(OUT, "enes_audio_oof.csv"))
+    bouts = [it for it in enes_bouts() if it["cause"] in CAUSES3]
+    timing = enes_timing()
+    ctx = context_features(enes_bouts(), timing)
+    rkeys = ["n_syl", "syl_med", "syl_iqr", "gap_med", "voiced_ratio", "span", "rate"]
+    ckeys = ["hour_sin", "hour_cos", "age", "h_since_prev", "h_since_hunger"] + [f"prev_{c}" for c in CAUSES3]
+    X = np.array([[timing[b["key"]][k] for k in rkeys] + [ctx[b["key"]][k] for k in ckeys] for b in bouts], float)
+    y = np.array([CAUSES3.index(b["cause"]) for b in bouts])
+    babies = np.array([b["baby"] for b in bouts])
+    keys = [b["key"] for b in bouts]
+    variants = {"맥락 + 아기 이력 (기존 최고)": leave_baby_out_tab(X, y, babies, 3)}
+    audio = {}
+    for (stage, model, cond), g in A.groupby(["stage", "model", "cond"]):
+        g = g.drop_duplicates("key").set_index("key")
+        if not set(keys) <= set(g.index):
+            continue
+        Pa = g.loc[keys, CAUSES3].values
+        audio[f"{stage} {model} {cond}"] = Pa
+        variants[f"+ 소리 {stage} {model} {cond}"] = leave_baby_out_tab(np.hstack([X, Pa]), y, babies, 3)
+
+    tkey = lambda b: timing[b["key"]]["time"] if pd.notna(timing[b["key"]]["time"]) else pd.Timestamp.min
+    order = {bb: sorted(np.where(babies == bb)[0], key=lambda i: tkey(bouts[i])) for bb in np.unique(babies)}
+
+    def online(Pg):
+        """아기 이력(라플라스 평활 원인 빈도)과 곱해 시간순 예측. 반환: 예측 확률, 이력 개수."""
+        P, K = np.zeros_like(Pg), np.zeros(len(y), int)
+        for bb, idx in order.items():
+            counts = np.zeros(3)
+            for k, i in enumerate(idx):
+                c = Pg[i] * (counts + 1.0) / (counts.sum() + 3.0)
+                P[i], K[i] = c / c.sum(), k
+                counts[y[i]] += 1
+        return P, K
+
+    h = CAUSES3.index("hunger")
+    base_P, K = online(variants["맥락 + 아기 이력 (기존 최고)"])
+    rng = np.random.default_rng(config.SEED)
+    ub = np.unique(babies)
+    bi = {b: np.where(babies == b)[0] for b in ub}
+    boots = [np.concatenate([bi[b] for b in rng.choice(ub, len(ub))]) for _ in range(1000)]
+
+    def score(P, ix):
+        return balanced_accuracy_score(y[ix], P[ix].argmax(1)), roc_auc_score(y[ix] == h, P[ix, h])
+    L = ["# 소리(대형 모델) + 맥락 + 아기 이력 (EnesBabyCries, 시간순)", "",
+         "- 소리 확률: joint_train.py 아기 분리 5겹 예측. 맥락 RF: 한 아기씩 빼고 학습. 이력: 그 아기의 이전 원인 빈도.",
+         "- Δ는 기존 최고(맥락 + 아기 이력) 대비, 괄호는 아기 단위 부트스트랩 95% 구간.", "",
+         "| 방법 | 전체 균형 정확도 | 전체 배고픔 AUC | 이력 10개+ 균형 정확도 | Δ균형 정확도(전체) |",
+         "|---|---:|---:|---:|---|"]
+    for name, Pg in variants.items():
+        P, _ = online(Pg)
+        ten = np.where(K >= 10)[0]
+        b_all, a_all = score(P, np.arange(len(y)))
+        b10, _ = score(P, ten)
+        d = [score(P, ix)[0] - score(base_P, ix)[0] for ix in boots]
+        lo, hi = np.percentile(d, [2.5, 97.5])
+        L.append(f"| {name} | {b_all:.3f} | {a_all:.3f} | {b10:.3f} | "
+                 f"{b_all - score(base_P, np.arange(len(y)))[0]:+.3f} ({lo:+.2f}~{hi:+.2f}) |")
+    L += ["", "## 참고: 소리 확률만 (아기 이력 없이)", "", "| 소리 모델 | 균형 정확도 | 배고픔 AUC |", "|---|---:|---:|"]
+    for name, Pa in audio.items():
+        b_, a_ = score(Pa, np.arange(len(y)))
+        L.append(f"| {name} | {b_:.3f} | {a_:.3f} |")
+    _save_report("ONLINE_AUDIO_REPORT.md", L)
+
+
 # --- iFLYTEK/Baidu 6클래스 → EnesBabyCries 교차 평가 ---------------------------------
 BAIDU_MAP = {"hungry": "hunger", "hug": "isolation", "uncomfortable": "discomfort", "diaper": "discomfort"}
 
@@ -685,7 +755,7 @@ def _save_report(name, L):
 
 if __name__ == "__main__":
     ap = argparse.ArgumentParser()
-    ap.add_argument("what", choices=["enes", "pain", "extra", "online", "baidu", "ifpalvd"])
+    ap.add_argument("what", choices=["enes", "pain", "extra", "online", "online_audio", "baidu", "ifpalvd"])
     args = ap.parse_args()
     {"enes": run_enes, "pain": run_pain, "extra": run_extra, "online": run_online,
-     "baidu": run_baidu, "ifpalvd": run_ifpalvd}[args.what]()
+     "online_audio": run_online_audio, "baidu": run_baidu, "ifpalvd": run_ifpalvd}[args.what]()

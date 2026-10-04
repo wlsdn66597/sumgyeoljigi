@@ -4,8 +4,14 @@
 # 순서: ② 동결 프로브(+① 아기별 정규화) → ④ 울음 추가 사전학습(DAPT) → ⑤ 시간 구조 모델 → ③ 안정화 미세조정 → 보고서
 cd ~/cry
 PY=.venv/bin/python
-export CRY_JOINT=~/cry/data/joint2 CRY_RUNS=~/cry/data/runs2 HF_HUB_OFFLINE=1
-run() { for i in 1 2 3; do "$@" && return 0; echo "실패, 재시도 $i: $*"; sleep 60; done; return 1; }
+export CRY_JOINT=~/cry/data/joint2 CRY_RUNS=~/cry/data/runs2 HF_HUB_OFFLINE=1 CRY_WORKERS=4
+# 다른 사람이 GPU를 쓰는 중이면 빌 때까지 기다린다(우리 작업은 아래에서 하나씩만 돈다)
+wait_gpu() {
+  while [ "$(nvidia-smi --query-gpu=memory.used --format=csv,noheader,nounits | head -1)" -gt 2000 ]; do
+    echo "[$(date +%H:%M)] GPU 사용 중 - 대기"; sleep 120
+  done
+}
+run() { for i in 1 2 3; do wait_gpu; "$@" && return 0; echo "실패, 재시도 $i: $*"; sleep 60; done; return 1; }
 probe_all() {   # 프로브와 반복·귀무 비교(정규화 없음 / 아기별)는 GPU를 적게 써서 뒤에서 병렬로
   local m=$1; mkdir -p $CRY_RUNS/probe/$m
   [ -f $CRY_RUNS/probe/$m/robust_baby.csv ] && return 0     # 이미 끝난 모델은 건너뜀
@@ -35,10 +41,14 @@ for m in w2v2_l unispeech_l; do run $PY joint_train.py extract --model $m; probe
 # Corvin 통증 대조: 조용한 구간(배경)만으로도 맞히면 녹음 장소 지름길
 for m in wavlm_l ast voc2vec; do [ -f $CRY_RUNS/CORVIN_BG_$m.md ] || $PY joint_train.py background --model $m; done
 
-# ⑤ 시간 구조 모델과 ③ 미세조정은 GPU를 나눠 병렬로
-(for m in voc2vec voc2vec_dapt wavlm_l; do
-  run $PY joint_train.py extract --model $m --windows && run $PY joint_train.py temporal --model $m --epochs 40 --seeds 3 > $CRY_RUNS/temporal_$m.log 2>&1
-done) &
+wait    # 뒤에서 돌던 프로브가 끝난 뒤에 무거운 단계로(2026-10-02 병렬 실행 중 서버가 멈춘 적이 있다)
+
+# ⑤ 시간 구조 모델 (하나씩)
+for m in voc2vec voc2vec_dapt wavlm_l; do
+  [ -f $CRY_RUNS/temporal/$m/preds.csv ] && continue
+  run $PY joint_train.py extract --model $m --windows
+  run $PY joint_train.py temporal --model $m --epochs 40 --seeds 3 > $CRY_RUNS/temporal_$m.log 2>&1
+done
 
 # ③ 안정화 미세조정: 실측 잔향·잡음 증강, 층 가중합, 낮은 학습률, 아기(그룹) 구분 방해
 for m in voc2vec_dapt voc2vec; do

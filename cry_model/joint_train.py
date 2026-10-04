@@ -622,10 +622,14 @@ class SeqNet(nn.Module):
 def cmd_temporal(a):
     m = load_meta()
     z = np.load(os.path.join(RUNS, "feats", f"{a.model}_win.npz"), allow_pickle=True)
-    pos = {k: i for i, k in enumerate(z["ids"])}
+    # npz 항목은 접근할 때마다 파일 전체를 다시 읽는다. 반드시 한 번만 꺼내 쓸 것
+    # (클립마다 z["X"]를 읽었더니 수백 GB가 쌓여 서버가 멈췄다, 2026-10-02·10-04)
+    ids0, X0, o0 = z["ids"], z["X"], z["offs"]
+    pos = {k: i for i, k in enumerate(ids0)}
     sel = [pos[k] for k in m.id]
-    Xw = np.concatenate([z["X"][z["offs"][i]:z["offs"][i + 1]] for i in sel])
-    offs = np.concatenate([[0], np.cumsum([z["offs"][i + 1] - z["offs"][i] for i in sel])])
+    Xw = np.concatenate([X0[o0[i]:o0[i + 1]] for i in sel])
+    offs = np.concatenate([[0], np.cumsum([o0[i + 1] - o0[i] for i in sel])])
+    del X0
     L, D = Xw.shape[1:]
     T = int(np.diff(offs).max())
     Xall = np.zeros((len(m), T, L, D), np.float16)

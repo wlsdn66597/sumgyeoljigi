@@ -632,13 +632,20 @@ def cmd_temporal(a):
     del X0
     L, D = Xw.shape[1:]
     T = int(np.diff(offs).max())
+    print(f"창 {len(Xw)}개, 패딩 배열 {len(m) * T * L * D * 2 / 2 ** 30:.1f}GB(fp16) 예상", flush=True)
     Xall = np.zeros((len(m), T, L, D), np.float16)
     pad = np.ones((len(m), T), bool)
     for i in range(len(m)):
         n = offs[i + 1] - offs[i]
         Xall[i, :n], pad[i, :n] = Xw[offs[i]:offs[i + 1]], False
-    mu = Xw.astype(np.float32).mean(0)
-    sd = Xw.astype(np.float32).std(0) + 1e-5
+    s1, s2 = np.zeros(Xw.shape[1:]), np.zeros(Xw.shape[1:])   # 평균·표준편차를 조각으로(전체 float 복사본 없이)
+    for i in range(0, len(Xw), 2000):
+        c = Xw[i:i + 2000].astype(np.float64)
+        s1 += c.sum(0)
+        s2 += (c ** 2).sum(0)
+    mu = (s1 / len(Xw)).astype(np.float32)
+    sd = (np.sqrt(np.maximum(s2 / len(Xw) - (s1 / len(Xw)) ** 2, 0)) + 1e-5).astype(np.float32)
+    del Xw
     out_dir = os.path.join(RUNS, "temporal", a.model)
     os.makedirs(out_dir, exist_ok=True)
     preds = []
@@ -1042,7 +1049,26 @@ def cmd_report(_):
     print("\n".join(L))
 
 
+def mem_guard(min_free_gb=float(os.environ.get("CRY_MIN_FREE_GB", "3"))):
+    """서버 보호(2026-10-02 서버 정지 재발 방지). 서버 전체의 남은 메모리(MemAvailable)가 기준 아래로
+    떨어지면 이 프로세스를 스스로 끝낸다. 실행 스크립트의 cgroup 상한(MemoryMax)과 함께 두 겹으로 막는다."""
+    if not os.path.exists("/proc/meminfo"):
+        return
+    import threading
+
+    def loop():
+        while True:
+            with open("/proc/meminfo") as f:
+                avail = next(int(l.split()[1]) for l in f if l.startswith("MemAvailable")) / 2 ** 20
+            if avail < min_free_gb:
+                print(f"[mem_guard] 서버 남은 메모리 {avail:.1f}GB < {min_free_gb}GB → 종료", flush=True)
+                os._exit(99)
+            time.sleep(0.5)
+    threading.Thread(target=loop, daemon=True).start()
+
+
 def main():
+    mem_guard()
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)
     p = sp.add_parser("convert")

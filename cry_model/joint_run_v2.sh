@@ -11,7 +11,15 @@ wait_gpu() {
     echo "[$(date +%H:%M)] GPU 사용 중 - 대기"; sleep 120
   done
 }
-run() { for i in 1 2 3; do wait_gpu; "$@" && return 0; echo "실패, 재시도 $i: $*"; sleep 60; done; return 1; }
+# 메모리 보호(2026-10-02 서버 정지 재발 방지): 작업마다 cgroup 상한을 걸어 넘으면 그 작업만 죽게 한다.
+# 서버 전체 여유가 3GB 아래로 내려가면 joint_train.py 안의 mem_guard가 스스로 끝낸다.
+MEM_MAX=${CRY_MEM_MAX:-20G}
+if command -v systemd-run > /dev/null && systemd-run --user --scope -q -p MemoryMax=64M true 2> /dev/null; then
+  CAP=(systemd-run --user --scope -q -p MemoryMax=$MEM_MAX -p MemorySwapMax=0)
+else
+  CAP=()
+fi
+run() { for i in 1 2 3; do wait_gpu; "${CAP[@]}" "$@" && return 0; echo "실패, 재시도 $i: $*"; sleep 60; done; return 1; }
 probe_all() {   # 프로브와 반복·귀무 비교(정규화 없음 / 아기별)는 GPU를 적게 써서 뒤에서 병렬로
   local m=$1; mkdir -p $CRY_RUNS/probe/$m
   [ -f $CRY_RUNS/probe/$m/robust_baby.csv ] && return 0     # 이미 끝난 모델은 건너뜀

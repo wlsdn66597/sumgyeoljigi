@@ -155,7 +155,7 @@ def cmd_ctx(_):
 
 # --- 재생 ---------------------------------------------------------------------------
 def replay(rows, X, basis, ctxs, hint_s, p_answer, noise, seed, labels, half_life=None, w_sound=1.0,
-           proto_from="all"):
+           proto_from="all", sound_method="proto"):
     """아기마다 새 CryPersonal을 만들어 울음을 시간순으로 넣는다. 반환: 평가 대상 울음(이전 울음 10개 이상)의 기록."""
     rng = np.random.default_rng(seed)
     rec = []
@@ -165,7 +165,7 @@ def replay(rows, X, basis, ctxs, hint_s, p_answer, noise, seed, labels, half_lif
     for bb, ks in by.items():
         bs = basis[bb] if bb in basis else basis
         dev = cp.CryPersonal(bs, ctxs[bb], k_min=K_MIN, hint_seconds=hint_s or 10 ** 6, half_life=half_life,
-                             w_sound=w_sound, proto_from=proto_from)
+                             w_sound=w_sound, proto_from=proto_from, sound_method=sound_method)
         for n, k in enumerate(ks):
             r = rows[k]
             y = labels[k]

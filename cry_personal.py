@@ -44,7 +44,7 @@ def ctx_features(t, last_cry_t, last_feed_t):
 
 class CryPersonal:
     def __init__(self, basis_path, ctx_path=None, state_path=None, k_min=10, temp=3.0, show_min=0.5,
-                 hint_seconds=10, half_life=8, w_sound=0.0, proto_from="all"):
+                 hint_seconds=10, half_life=8, w_sound=0.0, proto_from="all", sound_method="proto", k_nn=3):
         """basis_path: npz 경로 또는 {"mean","std","pca"} 딕셔너리. ctx_path: json 경로 또는 딕셔너리."""
         b = basis_path if isinstance(basis_path, dict) else np.load(basis_path)
         self.mu, self.sd, self.P = b["mean"], b["std"], b["pca"]
@@ -59,6 +59,9 @@ class CryPersonal:
         # w_sound: 소리 유사도를 힌트에 얼마나 반영할지(확률의 거듭제곱). 0이면 계산만 하고 섞지 않는다
         # proto_from: 이전 울음을 '울음 전체' 평균(all)으로 비교. 처음 몇 초만 쓰면 더 나빴다(0.428 → 0.381)
         self.half_life, self.w_sound, self.proto_from = half_life, w_sound, proto_from
+        # sound_method: proto(원인별 평균과 코사인) / knn(가장 비슷한 이전 울음 k개의 가중 투표).
+        #   가상 라벨 시뮬레이션(sim_synthetic.py)에서 아기별 규칙을 피드백 10~25개로 배울 때 knn 0.53 > proto 0.43
+        self.sound_method, self.k_nn = sound_method, k_nn
         self.state_path = state_path
         self.episodes = []            # {"id", "t0", "t1", "z", "action"}
         self.last_feed = None
@@ -114,7 +117,8 @@ class CryPersonal:
         parts = {"context": p_ctx, "history": p_prior}
         p = p_ctx * p_prior
         if len(labeled) >= self.k_min and len(embs):
-            p_proto = self._proto(self._project(np.mean(embs, 0)), labeled)
+            zq = self._project(np.mean(embs, 0))
+            p_proto = self._knn(zq, labeled) if self.sound_method == "knn" else self._proto(zq, labeled)
             parts["sound"] = p_proto
             if self.w_sound:
                 p = p * p_proto ** self.w_sound
@@ -154,6 +158,18 @@ class CryPersonal:
                 s[k] = float(zc @ pc / (np.linalg.norm(zc) * np.linalg.norm(pc) + 1e-9))
         e = np.exp(self.temp * (s - s.max()))
         return e / e.sum()
+
+    def _knn(self, z, labeled):
+        key = "zh" if self.proto_from == "first" else "z"
+        Z = np.array([e.get(key, e["z"]) for e in self.episodes])
+        mu = Z.mean(0)
+        P = np.array([e.get(key, e["z"]) for e in labeled]) - mu
+        q = z - mu
+        sims = P @ q / (np.linalg.norm(P, axis=1) * np.linalg.norm(q) + 1e-9)
+        top = np.argsort(-sims)[: self.k_nn]
+        y = np.array([ACTIONS.index(labeled[i]["action"]) for i in top])
+        p = np.bincount(y, weights=np.exp(self.temp * sims[top]), minlength=3) + 0.05
+        return p / p.sum()
 
     def _context(self, t, last_cry):
         if self.ctx is None:

@@ -3,6 +3,7 @@
     python enes_v3.py build                  # 로컬: 음절을 무음 없이 이어 붙인 울음 조각 wav + meta.csv
     python enes_v3.py yamnet                 # 로컬: YAMNet 창 임베딩 → feats/yamnet.npz
     python enes_v3.py extract --model clap   # 서버: 대형 모델 창 임베딩 → feats/<model>.npz
+    python enes_v3.py smile --set compare    # 서버: openSMILE 음향 특징(ComParE 6,373개 / eGeMAPS 88개) → feats/<set>.npz
     python enes_v3.py eval --model clap      # 서버: 아기 분리(반복·귀무·나이별) + 아기별 시간순 개인화
     python enes_v3.py report                 # 서버: 모든 결과 → ENES_V3_REPORT.md
 
@@ -155,6 +156,54 @@ def cmd_extract(a):
                 print(f"  {a.model} {i + 1}/{len(m)} {time.time() - t0:.0f}s", flush=True)
     np.savez(out, ids=m.id.values, X=np.stack(X), ep=np.array(ep_idx))
     print(f"{a.model}: 창 {len(X)}개 {np.stack(X).shape}")
+
+
+# --- 서버: openSMILE 음향 특징 ---------------------------------------------------------
+SMILE_SETS = {"compare": "ComParE_2016", "egemaps": "eGeMAPSv02"}
+_SMILE = None
+
+
+def _smile_init(name):
+    global _SMILE
+    import opensmile
+    _SMILE = opensmile.Smile(feature_set=getattr(opensmile.FeatureSet, name),
+                             feature_level=opensmile.FeatureLevel.Functionals)
+
+
+def _smile_episode(args):
+    """조각 하나를 4초 창으로 나눠 창마다 openSMILE 통계 특징을 계산한다(작업자 프로세스)."""
+    i, path = args
+    x, _ = sf.read(path, dtype="float32")
+    out = []
+    for w in windows(x):
+        f = _SMILE.process_signal(w, SR).values[0].astype(np.float32)
+        out.append(f)
+    return i, np.stack(out)
+
+
+def cmd_smile(a):
+    """ChatterBaby(UCLA)가 쓴 openSMILE 특징. 음높이(F0), 크기, 떨림(jitter·shimmer), 음색(스펙트럼·MFCC) 통계.
+    딥러닝 임베딩과 달리 사람이 설계한 목소리 특징이라, 아기별 울음 차이를 다르게 잡을 수 있다."""
+    from multiprocessing import Pool
+    m = load_meta()
+    out = os.path.join(root(), "feats", f"{a.set}.npz")
+    if os.path.exists(out):
+        print("이미 있음:", out)
+        return
+    os.makedirs(os.path.dirname(out), exist_ok=True)
+    jobs = [(i, os.path.join(root(), "wav", r.id + ".wav")) for i, r in enumerate(m.itertuples())]
+    res, t0 = {}, time.time()
+    with Pool(a.workers, initializer=_smile_init, initargs=(SMILE_SETS[a.set],)) as pool:
+        for k, (i, F) in enumerate(pool.imap_unordered(_smile_episode, jobs, chunksize=4)):
+            res[i] = F
+            if (k + 1) % 200 == 0:
+                print(f"  {a.set} {k + 1}/{len(jobs)} {time.time() - t0:.0f}s", flush=True)
+    X = np.concatenate([res[i] for i in range(len(m))])
+    ep = np.concatenate([np.full(len(res[i]), i) for i in range(len(m))])
+    bad = ~np.isfinite(X)
+    X[bad] = 0
+    np.savez(out, ids=m.id.values, X=X[:, None, :].astype(np.float32), ep=ep)
+    print(f"{a.set}: 창 {len(X)}개 × 특징 {X.shape[1]}개, 비정상 값 {int(bad.sum())}개를 0으로 ({time.time() - t0:.0f}s)")
 
 
 # --- 서버: 평가 ------------------------------------------------------------------------
@@ -555,6 +604,9 @@ def main():
     sp.add_parser("yamnet")
     p = sp.add_parser("extract")
     p.add_argument("--model", required=True)
+    p = sp.add_parser("smile")
+    p.add_argument("--set", choices=list(SMILE_SETS), required=True)
+    p.add_argument("--workers", type=int, default=12)
     p = sp.add_parser("eval")
     p.add_argument("--model", required=True)
     p.add_argument("--repeats", type=int, default=5)
@@ -567,7 +619,7 @@ def main():
     p.add_argument("--pperms", type=int, default=50)
     sp.add_parser("report")
     a = ap.parse_args()
-    {"build": cmd_build, "yamnet": cmd_yamnet, "extract": cmd_extract, "eval": cmd_eval, "personal": cmd_personal, "final": cmd_final,
+    {"build": cmd_build, "yamnet": cmd_yamnet, "extract": cmd_extract, "smile": cmd_smile, "eval": cmd_eval, "personal": cmd_personal, "final": cmd_final,
      "report": cmd_report}[a.cmd](a)
 
 

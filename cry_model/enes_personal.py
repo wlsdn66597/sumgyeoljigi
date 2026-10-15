@@ -2,6 +2,7 @@
 enes_v3.py가 만든 데이터·특징(ENES3/feats)을 쓴다. GPU 서버에서 실행.
 
     python enes_personal.py run --model clap          # 모델 하나(또는 ens: yamnet·clap·ast 평균)
+    python enes_personal.py run --model yamnet,compare  # 쉼표로 여러 모델을 평균(결과 이름 yamnet+compare)
     python enes_personal.py report                    # → ENES3/PERSONAL4_REPORT.md
 
 방법 (모두 시간순으로, 그 시점 이전 울음과 그 라벨만 쓴다)
@@ -212,7 +213,8 @@ def cmd_run(a):
     t = pd.to_datetime(B.t.values[sel])
     day = t.normalize().values
     order = {b: sorted(np.where(babies == b)[0], key=lambda i: (t[i], B.key.values[sel][i])) for b in np.unique(babies)}
-    models = ENS if a.model == "ens" else [a.model]
+    models = ENS if a.model == "ens" else a.model.split(",")
+    name = a.model.replace(",", "+")
     F = {mo: Feats(mo, m, B, sel) for mo in models}
     methods = a.methods.split(",")
     rows, keep = [], {}
@@ -232,13 +234,13 @@ def cmd_run(a):
                         preds.append({i: np.mean([p[i] for p in ps], 0) for i in ps[0]})
                     items = np.array(sorted(preds[0]))
                     met, best = nested(preds, y, babies, items)
-                    rows.append({"model": a.model, "method": meth, "history": history, "kind": kind, "r": r,
+                    rows.append({"model": name, "method": meth, "history": history, "kind": kind, "r": r,
                                  "n": len(items), "cfg": str(GRID[meth][best]), **met})
                     if kind == "real":
                         keep[(meth, history)] = (preds, items)
                     print(f"    {kind} {r} {history} {meth}: 균형 {met['bal']:.3f} ({time.time() - t0:.0f}s)", flush=True)
-            print(f"  {a.model} {kind} {r} 완료 {time.time() - t0:.0f}s", flush=True)
-    out_dir = os.path.join(ev.root(), "runs", a.model)
+            print(f"  {name} {kind} {r} 완료 {time.time() - t0:.0f}s", flush=True)
+    out_dir = os.path.join(ev.root(), "runs", name)
     os.makedirs(out_dir, exist_ok=True)
     pd.DataFrame(rows).to_csv(os.path.join(out_dir, "personal4.csv"), index=False)
     # 실제 라벨 예측(설정별)을 저장: 최종 결합·학습 곡선용

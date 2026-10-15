@@ -3,6 +3,7 @@
     python sim_augment.py prep --workers 12   # 울음 2,521개 × (원본 + 방 조건 변형 4개), 앞 20초 → 음향 요약 + 파이식 YAMNet 임베딩
     python sim_augment.py prep --workers 12 --ops stretch,pitch --tag mild   # 울음 변형(속도·음높이만) 4개
     python sim_augment.py run                 # → DATA/runs/synthetic/AUGMENT_REPORT.md
+    python sim_augment.py split               # 가상 라벨만으로 6:2:2 학습·검증·시험 → SPLIT622_REPORT.md
 
   GPU 서버: NUNI_CRY_DATA=~/cry/data CRY_JOINT=~/cry/data/joint2 (GPU는 안 쓰고 CPU 병렬, 각 2~3분)
 
@@ -267,6 +268,8 @@ def make_labels(m, A0, world, eps, seed):
     rng = np.random.default_rng(seed)
     km = lambda Z: KMeans(3, n_init=10, random_state=seed).fit_predict(Z)  # noqa: E731
     y = rng.integers(0, 3, len(m))
+    if world == "none":                                          # ① 신호 없음: 무작위 행동
+        return y
     if world == "global":
         Z = np.zeros_like(A0)
         for _, idx in m.groupby("source").indices.items():      # 출처(녹음 환경)마다 기준을 맞춘 뒤 나눈다
@@ -303,12 +306,15 @@ def general_model(E, y, groups, seed, vers, view):
     pca = PCA(32, random_state=seed).fit((Xtr - mu) / sd)
     f = lambda X: pca.transform((X - mu) / sd)  # noqa: E731
     Ztr, Zva = f(Xtr), f(E[va, 0])
-    best = max((0.01, 0.1, 1.0), key=lambda C: BA(
-        y[va], LR(C=C, max_iter=2000, class_weight="balanced").fit(Ztr, ytr).predict(Zva)))
+    fits = {C: LR(C=C, max_iter=2000, class_weight="balanced").fit(Ztr, ytr) for C in (0.01, 0.1, 1.0)}
+    vals = {C: BA(y[va], g.predict(Zva)) for C, g in fits.items()}
+    best = max(vals, key=vals.get)
     Xtv, ytv = stack(tr | va)
     clf = LR(C=best, max_iter=2000, class_weight="balanced").fit(f(Xtv), ytv)
     ti = np.where(te)[0]
-    return {"clean": BA(y[ti], clf.predict(f(E[ti, 0]))), "changed": BA(y[ti], clf.predict(f(E[ti, view[ti]])))}
+    return {"train": BA(ytr, fits[best].predict(Ztr)), "val": vals[best],
+            "clean": BA(y[ti], clf.predict(f(E[ti, 0]))), "changed": BA(y[ti], clf.predict(f(E[ti, view[ti]]))),
+            "n_tr": int(tr.sum()), "n_va": int(va.sum()), "n_te": int(te.sum())}
 
 
 def r2(P, T):
@@ -449,9 +455,7 @@ def diagnostics(m, A, E, G, O, vers):
 
 
 # --- 4. 실행 -----------------------------------------------------------------------
-def cmd_run(a):
-    import warnings
-    warnings.filterwarnings("ignore")
+def load_all():
     m = pd.read_csv(os.path.join(OUT, "items.csv"))
     m["baby"], m["stop"] = m.baby.fillna("").astype(str), m.stop.fillna("").astype(str)
     z = np.load(os.path.join(OUT, "prep.npz"))
@@ -465,8 +469,15 @@ def cmd_run(a):
         VAR["울음 변형"] = list(range(N_AUG + 1, 2 * N_AUG + 1))
     A, E, O = A.astype(np.float64), E.astype(np.float64), O.astype(int)
     MODES = {"없음": [0], **{k: [0] + v for k, v in VAR.items()}}
+    view = np.random.default_rng(99).integers(1, N_AUG + 1, len(m))   # '조건이 바뀐' 시험에 쓰는 변형(설정 간 공통)
+    return m, A, E, G, O, VAR, MODES, view
+
+
+def cmd_run(a):
+    import warnings
+    warnings.filterwarnings("ignore")
+    m, A, E, G, O, VAR, MODES, view = load_all()
     N = len(m)
-    view = np.random.default_rng(99).integers(1, N_AUG + 1, N)     # '조건이 바뀐' 시험에 쓰는 변형(설정 간 공통)
     enes = (m.source == "enes").values
     t0 = time.time()
     S, R2 = spaces(m, A, E, view)
@@ -589,6 +600,134 @@ def report(m, R2, diag, GN, PS, ci, n_rule, modes):
     print(txt)
 
 
+# --- 5. 6:2:2 학습·검증·시험 정리 ------------------------------------------------------
+METHODS = [("proto", 0), ("knn", 1), ("knn", 3), ("knn", 5)]
+
+
+def predict(S, y, ref, qry, vers, method, k):
+    """답이 있는 ref 울음으로 qry 울음을 맞힌다. proto = 행동별 평균과 코사인, knn = 가까운 k개 가중 투표(파이 모듈과 같음)."""
+    mu = S[ref, 0].mean(0)
+    P = (S[ref][:, vers] - mu).reshape(-1, S.shape[-1])
+    yl = np.repeat(y[ref], len(vers))
+    Pn = P / (np.linalg.norm(P, axis=1, keepdims=True) + 1e-9)
+    Q = S[qry, 0] - mu
+    Q = Q / (np.linalg.norm(Q, axis=1, keepdims=True) + 1e-9)
+    if method == "proto":
+        C = np.array([P[yl == c].mean(0) if (yl == c).any() else np.full(P.shape[1], np.nan) for c in range(3)])
+        Cn = C / (np.linalg.norm(C, axis=1, keepdims=True) + 1e-9)
+        return np.nan_to_num(Q @ Cn.T, nan=-9.0).argmax(1)
+    out = []
+    for s in Q @ Pn.T:
+        top = np.argsort(-s)[: k * len(vers)]
+        out.append(np.bincount(yl[top], weights=np.exp(3 * s[top]), minlength=3).argmax())
+    return np.array(out, int)
+
+
+def split622(m, babies):
+    """아기마다 시간순으로 앞 60% 학습 / 다음 20% 검증 / 마지막 20% 시험(파이가 실제로 겪는 순서)."""
+    out = {}
+    for b in babies:
+        idx = np.where(m.baby.values == b)[0]
+        idx = idx[np.lexsort((m.bout.values[idx], m.t.values[idx]))]
+        ntr, nva = int(round(len(idx) * 0.6)), max(1, int(round(len(idx) * 0.2)))
+        out[b] = (idx[:ntr], idx[ntr:ntr + nva], idx[ntr + nva:])
+    return out
+
+
+def within_baby(S, y, sp, vers):
+    """검증 20%로 방법(proto / knn k=1·3·5)을 고르고, 학습 + 검증 답으로 시험 20%를 맞힌다(아기 전체 합산)."""
+    from sklearn.metrics import balanced_accuracy_score as BA
+
+    def score(refs, part, me, k):
+        yt, yp = [], []
+        for parts in sp.values():
+            ref, q = np.concatenate([parts[i] for i in refs]), parts[part]
+            if len(q) and len(ref):
+                yt += list(y[q])
+                yp += list(predict(S, y, ref, q, vers, me, k))
+        return BA(yt, yp)
+    vals = {mk: score((0,), 1, *mk) for mk in METHODS}
+    best = max(vals, key=vals.get)
+    return {"train": score((0,), 0, *best), "val": vals[best], "test": score((0, 1), 2, *best),
+            "method": best[0] if best[0] == "proto" else f"knn{best[1]}"}
+
+
+def history_only(y, sp, rng):
+    from sklearn.metrics import balanced_accuracy_score as BA
+    yt, yp = [], []
+    for tr, va, te in sp.values():
+        pred = int(np.argmax(np.bincount(y[np.concatenate([tr, va])], minlength=3) + rng.random(3) * 1e-3))
+        yt += list(y[te])
+        yp += [pred] * len(te)
+    return BA(yt, yp)
+
+
+def cmd_split(a):
+    """가상 라벨만으로 6:2:2 학습·검증·시험 성능을 정리한다(실제 라벨은 쓰지 않는다).
+    A. 처음 보는 아기: 아기·업로더 단위 6:2:2, 일반 모델(YAMNet PCA 32 + 로지스틱 회귀)
+    B. 같은 아기: 아기마다 시간순 6:2:2, 파이 개인화(이전 답 울음과 비교)"""
+    import warnings
+    warnings.filterwarnings("ignore")
+    m, A, E, G, O, VAR, MODES, view = load_all()
+    enes = (m.source == "enes").values
+    S, _ = spaces(m, A, E, view)
+    S = {k: S[k] for k in ("YAMNet 16차원(파이 기본)", "음향 요약 예측(증강으로 배움)", "실제 음향 요약 6개")}
+    all_b = sorted(m.baby[enes].unique())
+    rule_b = sorted(b for b, n in m.baby[enes].value_counts().items() if n >= 15)
+    gen, wb = [], []
+    t0 = time.time()
+    for world, eps in (("none", 1.0), ("global", 0.0), ("global", 0.3), ("baby", 0.0), ("baby", 0.3)):
+        sp = split622(m, rule_b if world == "baby" else all_b)
+        for seed in range(a.seeds):
+            y = make_labels(m, A[:, 0], world, eps, seed)
+            sel = enes if world == "baby" else np.ones(len(m), bool)      # 아기별 규칙은 Enes에서만 정의된다
+            for mode, vers in MODES.items():
+                gen.append({"world": world, "eps": eps, "seed": seed, "aug": mode,
+                            **general_model(E[sel], y[sel], m.group.values[sel], seed, vers, view[sel])})
+                for s, Sx in S.items():
+                    wb.append({"world": world, "eps": eps, "seed": seed, "aug": mode, "space": s,
+                               **within_baby(Sx, y, sp, vers)})
+            wb.append({"world": world, "eps": eps, "seed": seed, "aug": "없음", "space": "이력만(답 빈도)",
+                       "test": history_only(y, sp, np.random.default_rng(seed))})
+        print(f"  {world} {eps} {time.time() - t0:.0f}s", flush=True)
+    GN, WB = pd.DataFrame(gen), pd.DataFrame(wb)
+    os.makedirs(RUNS, exist_ok=True)
+    GN.to_csv(os.path.join(RUNS, "split622_general.csv"), index=False)
+    WB.to_csv(os.path.join(RUNS, "split622_within.csv"), index=False)
+    n_te = sum(len(v[2]) for v in split622(m, all_b).values())
+    modes = list(MODES)
+    wname = {"none": "① 신호 없음", "global": "② 공통 규칙", "baby": "③ 아기마다 다른 규칙"}
+    L = ["# 가상 행동 라벨: 6:2:2 학습·검증·시험 (실제 원인 라벨은 쓰지 않음)", "",
+         "- 라벨은 전부 가상(음향 요약 규칙). 균형 정확도, 무작위 0.333, 시드 5개 평균.",
+         f"- 증강({' / '.join(modes)})은 학습·검증 울음에만 넣는다. 시험 울음은 원본.", "",
+         "## A. 처음 보는 아기 — 아기·업로더 단위 6:2:2, 일반 모델", "",
+         f"학습 {GN.n_tr.iloc[0]} / 검증 {GN.n_va.iloc[0]} / 시험 {GN.n_te.iloc[0]}개(①② 전체 울음 기준), ③은 Enes 울음 612개를 아기 단위로 나눔.", "",
+         "| 가상 세계 | 라벨 잡음 | 학습 | 검증 | **시험** | 시험, 증강 " + " / ".join(modes[1:]) + " |", "|---|---|---:|---:|---:|---:|"]
+    for (w, e), g in GN.groupby(["world", "eps"], sort=False):
+        v = g.groupby("aug")[["train", "val", "clean"]].mean()
+        L.append(f"| {wname[w]} | {'-' if w == 'none' else f'{e:.0%}'} | {v.train['없음']:.3f} | {v.val['없음']:.3f} | "
+                 f"**{v.clean['없음']:.3f}** | " + " / ".join(f"{v.clean[k]:.3f}" for k in modes[1:]) + " |")
+    L += ["", "## B. 같은 아기 — 아기마다 시간순 6:2:2, 파이 개인화", "",
+          f"아기마다 앞 60% 울음의 답으로 학습, 다음 20%로 방법(proto / knn 1·3·5) 선택, 마지막 20%(Enes 전체 {n_te}개)로 시험. "
+          f"③은 규칙이 있는 아기 {len(rule_b)}명.", "",
+          "| 가상 세계 | 라벨 잡음 | 비교 공간 | 학습 | 검증 | **시험** | 시험, 증강 " + " / ".join(modes[1:]) + " | 고른 방법 |",
+          "|---|---|---|---:|---:|---:|---:|---|"]
+    for (w, e), g in WB.groupby(["world", "eps"], sort=False):
+        for s, gg in g.groupby("space", sort=False):
+            if s.startswith("이력"):
+                L.append(f"| {wname[w]} | {'-' if w == 'none' else f'{e:.0%}'} | {s} | - | - | **{gg.test.mean():.3f}** | - | - |")
+                continue
+            v = gg.groupby("aug")[["train", "val", "test"]].mean()
+            meth = gg[gg.aug == "없음"].method.value_counts().index[0]
+            L.append(f"| {wname[w]} | {'-' if w == 'none' else f'{e:.0%}'} | {s} | {v.train['없음']:.3f} | {v.val['없음']:.3f} | "
+                     f"**{v.test['없음']:.3f}** | " + " / ".join(f"{v.test[k]:.3f}" for k in modes[1:]) + f" | {meth} |")
+    L += ["", "학습 점수는 학습 울음을 학습 울음 자신으로 맞힌 값이라 knn1이면 1.0이 된다(참고용).",
+          "'실제 음향 요약 6개'는 정답을 만든 바로 그 숫자로 비교한 상한선이다."]
+    txt = "\n".join(L) + "\n"
+    open(os.path.join(RUNS, "SPLIT622_REPORT.md"), "w", encoding="utf-8").write(txt)
+    print(txt)
+
+
 def main():
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -600,8 +739,10 @@ def main():
     p = sp.add_parser("run")
     p.add_argument("--seeds", type=int, default=5)
     p.add_argument("--perms", type=int, default=20)
+    p = sp.add_parser("split")
+    p.add_argument("--seeds", type=int, default=5)
     a = ap.parse_args()
-    {"prep": cmd_prep, "run": cmd_run}[a.cmd](a)
+    {"prep": cmd_prep, "run": cmd_run, "split": cmd_split}[a.cmd](a)
 
 
 if __name__ == "__main__":

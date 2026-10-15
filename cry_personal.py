@@ -20,9 +20,8 @@
   - 답 5개부터 소리 예측을 기록하고, 최근 20개 중 비교가 8개 이상일 때 소리 포함 예측이 2개 이상 더 맞으면 소리를 섞는다.
   - 실제 Enes 재생에서 소리를 항상 섞으면 이력만보다 나빴다(0.433 → 0.350). 아기마다 다를 수 있어 기기가 스스로 재고 켠다.
   - 확정이 아닌 '쓸수록 맞춰지는 실험적 힌트'로만 보여주고, 확신이 낮거나 이전 답이 적으면 숨긴다(show / show2=False).
-행동(actions): 기본 6개(수유·기저귀·재우기·안아주기·트림·온도). 행동이 늘면 1순위 정확도는 내려가지만 무작위 대비 이득은
-  비슷하고(10차: 3개 0.52 / 무작위 0.33, 6개 0.30 / 0.17), 1·2순위가 더 의미 있어진다. 드문 행동(온도 등)은 소리보다
-  센서 맥락(온습도·수면 상태)이 맡아야 한다.
+행동(actions): 기본 3개(수유 / 기저귀 / 안아주기)이고 1·2순위를 함께 보여준다(top2, show2). ACTIONS6으로 늘릴 수 있다
+  (10차: 행동이 늘면 1순위는 내려가고 무작위 대비 이득은 비슷하다).
 
 필요 파일(cry_model/artifacts, 재생성 가능)
   yamnet_emb.tflite          export_yamnet_tflite.py — 점수 + 임베딩 출력
@@ -40,7 +39,7 @@ import numpy as np
 
 ACTIONS3 = ["feed", "diaper", "hold"]                                   # Enes 라벨과 같은 3개(예전 기본)
 ACTIONS6 = ["feed", "diaper", "sleep", "hold", "burp", "temp"]           # 실사용 6개
-ACTIONS = ACTIONS6                                                      # 기본은 실사용 6개
+ACTIONS = ACTIONS3                                                      # 기본 3개 + 1·2순위 표시
 EXTRA = ["self", "unknown", "other", "sick"]                            # 기록만 하는 답
 LABEL_KO = {"feed": "수유", "diaper": "기저귀", "sleep": "재우기", "hold": "안아주기·자세 바꾸기", "burp": "트림·가스 빼기",
             "temp": "온도·환경 조절", "self": "저절로 그침", "unknown": "모름", "other": "기타", "sick": "아파 보임"}
@@ -96,7 +95,7 @@ def _unpack(s, dtype=np.float16):
 
 class CryPersonal:
     def __init__(self, basis_path, ctx_path=None, state_path=None, k_min=10, temp=3.0, show_min=0.5,
-                 hint_seconds=10, half_life=8, w_sound=1.0, proto_from="all", sound_method="proto", k_nn=3, show2_min=0.6,
+                 hint_seconds=10, half_life=8, w_sound=1.0, proto_from="all", sound_method="proto", k_nn=3, show2_min=0.0,
                  acoustic_path=None, blocks=None, actions=None, gate=True, gate_n=8, gate_window=20, gate_margin=2,
                  track_from=5):
         """basis_path / acoustic_path: npz 경로 또는 딕셔너리. ctx_path: json 경로 또는 딕셔너리.
@@ -125,7 +124,9 @@ class CryPersonal:
             self.ctx = (np.array(c["coef"]), np.array(c["intercept"]), np.array(c["mean"]), np.array(c["std"]),
                         list(c.get("classes", ACTIONS3)))
         self.k_min, self.temp, self.show_min, self.hint_seconds = k_min, temp, show_min, hint_seconds
-        self.show2_min = show2_min      # 1·2순위를 함께 보여줄 기준(두 확률의 합). 행동이 많으면 1순위 확률이 낮아진다
+        # show2_min: 1·2순위를 함께 보여줄 기준(두 확률의 합). 행동 3개면 합이 늘 2/3 이상이라 기준을 두지 않고
+        #   답이 k_min개 쌓이면 보여준다. 행동을 늘릴 때만 0.6 정도로 올린다
+        self.show2_min = show2_min
         # half_life: 이력(이전 답 빈도)에서 최근 답일수록 크게 반영(답 8개마다 절반). 아기가 크면서 우는 이유
         #   비율이 바뀌어서다(재생 시험: 이력만 0.389 → 0.434). 소리 비교에는 쓰지 않는다
         # w_sound: 소리 유사도를 힌트에 얼마나 반영할지(확률의 거듭제곱). 0이면 계산·기록만 한다

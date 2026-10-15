@@ -302,20 +302,20 @@ def cmd_device(a):
             for bb in babies:
                 ix = np.where(m.baby.values == bb)[0]
                 ix = ix[np.lexsort((m.bout.values[ix], m.t.values[ix]))]
-                dev = cp.CryPersonal(basis, None, acoustic_path=kw.get("acoustic"), w_sound=kw.get("w_sound", 1.0),
+                dev = cp.CryPersonal(basis, None, actions=cp.ACTIONS3, acoustic_path=kw.get("acoustic"), w_sound=kw.get("w_sound", 1.0),
                                      gate=kw.get("gate", True), hint_seconds=10)
                 for i in ix:
                     t = float(m.t.values[i])
                     h = dev.hint(t, embs=[E[i, 0]])
                     if h["n_feedback"] >= 10:
                         yt.append(y[i])
-                        yp.append(cp.ACTIONS.index(h["top"]))
+                        yp.append(cp.ACTIONS3.index(h["top"]))
                         on.append(h["sound_on"])
-                        hit2.append(cp.ACTIONS[y[i]] in h["top2"])
+                        hit2.append(cp.ACTIONS3[y[i]] in h["top2"])
                         nf.append(h["n_feedback"])
                     dev.start(t)
                     dev.add_window(E[i, 0])
-                    dev.feedback(dev.end(t + 60), cp.ACTIONS[y[i]])
+                    dev.feedback(dev.end(t + 60), cp.ACTIONS3[y[i]])
             yt, hit2, nf = np.array(yt), np.array(hit2), np.array(nf)
 
             def top2(sel):

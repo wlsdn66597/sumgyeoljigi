@@ -142,7 +142,7 @@ def ctx_train(rows, exclude=None):
     mu, sd = F.mean(0), F.std(0) + 1e-6
     lr = LogisticRegression(C=1.0, max_iter=1000, class_weight="balanced").fit((F - mu) / sd, Y)
     return {"coef": lr.coef_.tolist(), "intercept": lr.intercept_.tolist(), "mean": mu.tolist(), "std": sd.tolist(),
-            "features": ["hour_sin", "hour_cos", "h_since_prev_cry", "h_since_feed"], "classes": cp.ACTIONS}
+            "features": ["hour_sin", "hour_cos", "h_since_prev_cry", "h_since_feed"], "classes": cp.ACTIONS3}
 
 
 def cmd_ctx(_):
@@ -164,7 +164,7 @@ def replay(rows, X, basis, ctxs, hint_s, p_answer, noise, seed, labels, half_lif
         by[r["baby"]].append(k)
     for bb, ks in by.items():
         bs = basis[bb] if bb in basis else basis
-        dev = cp.CryPersonal(bs, ctxs[bb], k_min=K_MIN, hint_seconds=hint_s or 10 ** 6, half_life=half_life,
+        dev = cp.CryPersonal(bs, ctxs[bb], actions=cp.ACTIONS3, k_min=K_MIN, hint_seconds=hint_s or 10 ** 6, half_life=half_life,
                              w_sound=w_sound, proto_from=proto_from, sound_method=sound_method)
         for n, k in enumerate(ks):
             r = rows[k]
@@ -182,7 +182,7 @@ def replay(rows, X, basis, ctxs, hint_s, p_answer, noise, seed, labels, half_lif
             eid = dev.end(r["t1"])
             if eid is not None and rng.random() < p_answer:
                 a = y if rng.random() >= noise else rng.choice([c for c in range(3) if c != y])
-                dev.feedback(eid, cp.ACTIONS[a])
+                dev.feedback(eid, cp.ACTIONS3[a])
     return pd.DataFrame(rec)
 
 

@@ -202,7 +202,7 @@ def replay(m, E, E10, y, basis, p_answer, noise, seed, sound_method="proto"):
     for b in babies:
         idx = m.index[(m.source == "enes") & (m.baby == b)].values
         idx = idx[np.argsort(m.t.values[idx], kind="stable")]
-        dev = cp.CryPersonal(basis, None, k_min=10, w_sound=1.0, half_life=8, hint_seconds=10,
+        dev = cp.CryPersonal(basis, None, actions=cp.ACTIONS3, k_min=10, w_sound=1.0, half_life=8, hint_seconds=10,
                              sound_method=sound_method)
         for i in idx:
             t = float(m.t.values[i])
@@ -217,7 +217,7 @@ def replay(m, E, E10, y, basis, p_answer, noise, seed, sound_method="proto"):
             eid = dev.end(t + float(m.dur_hint.values[i]))
             if eid is not None and rng.random() < p_answer:
                 ans = y[i] if rng.random() >= noise else rng.choice([c for c in range(3) if c != y[i]])
-                dev.feedback(eid, cp.ACTIONS[ans])
+                dev.feedback(eid, cp.ACTIONS3[ans])
     return pd.DataFrame(rec)
 
 

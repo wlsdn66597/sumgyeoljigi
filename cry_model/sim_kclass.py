@@ -301,6 +301,95 @@ def report(D):
     print(txt)
 
 
+# --- 4. 긴 사용 기간: 아기 여럿을 이어 붙인 가상 아기 ----------------------------------------------
+LONG_CFG = ["이력만", "YAMNet 16", "음향 변환 + MFCC", "음향 변환 + MFCC, 자가 검증"]
+LONG_BUCKETS = [(10, 19), (20, 39), (40, 59), (60, 79), (80, 999)]
+
+
+def _long_task(job):
+    """Enes 아기 4명씩 묶어 울음 약 100개짜리 가상 아기를 만든다. 아기마다 자기 평균을 빼(목소리 차이 제거) 같은
+    아기 안의 차이만 남기고, 각자의 시간 순서를 지키며 번갈아 넣는다. 반환: 울음마다 (설정, 정답, 1순위, 2순위 적중, 답 수)."""
+    world, K, seed = job
+    m, E0, MS = _W["m"], _W["E0"], _W["MS"]
+    order = _W["order"]
+    rng = np.random.default_rng(seed)
+    babies = list(order)
+    rng.shuffle(babies)
+    groups = [babies[i:i + 4] for i in range(0, len(babies) - len(babies) % 4, 4)]
+    En, Mn, Fn = E0.copy(), MS.copy(), _W["worlds"][world].copy()
+    gE, gM = E0[np.concatenate(list(order.values()))].mean(0), MS[np.concatenate(list(order.values()))].mean(0)
+    for ix in order.values():                                 # 아기마다 평균을 빼고 전체 평균을 더한다
+        En[ix] += gE - E0[ix].mean(0)
+        Mn[ix] += gM - MS[ix].mean(0)
+        Fn[ix] = (Fn[ix] - Fn[ix].mean(0)) / (Fn[ix].std(0) + 1e-9)
+    vorder = {}
+    for gi, grp in enumerate(groups):
+        pos = np.concatenate([np.arange(len(order[b])) / len(order[b]) for b in grp])
+        ix = np.concatenate([order[b] for b in grp])
+        vorder[f"v{gi}"] = ix[np.argsort(pos + rng.random(len(pos)) * 1e-6)]
+    y = baby_rule(m, Fn, vorder, K, None, seed)
+    actions = cp.ACTIONS3 if K == 3 else [f"a{k}" for k in range(K)]
+    rec = []
+    for name in LONG_CFG:
+        kw = CFG[name]
+        for ix in vorder.values():
+            dev = cp.CryPersonal(_W["basis"], None, acoustic_path=_W["ac"], actions=actions, hint_seconds=10, **kw)
+            for n_, i in enumerate(ix):
+                t = 1.7e9 + n_ * 3600.0
+                h = dev.hint(t, embs=[En[i]], mfcc=Mn[i])
+                if h["n_feedback"] >= 10:
+                    rec.append((world, K, seed, name, y[i], actions.index(h["top"]), actions[y[i]] in h["top2"],
+                                h["n_feedback"], h["sound_on"]))
+                dev.start(t)
+                dev.add_window(En[i])
+                dev.feedback(dev.end(t + 60, mfcc=(Mn[i], Mn[i])), actions[y[i]])
+    return rec
+
+
+def cmd_long(a):
+    import warnings
+    from multiprocessing import Pool
+    warnings.filterwarnings("ignore")
+    jobs = [(w, K, s) for w in ("요약 6", "eGeMAPS", "MFCC", "YAMNet", "스펙트럼 모양", "리듬") for K in (3, 4)
+            for s in range(a.seeds)]
+    rows, t0 = [], time.time()
+    with Pool(a.workers, initializer=_init_run) as pool:
+        for n, r in enumerate(pool.imap_unordered(_long_task, jobs)):
+            rows += r
+            if (n + 1) % 12 == 0:
+                print(f"  {n + 1}/{len(jobs)} {time.time() - t0:.0f}s", flush=True)
+    D = pd.DataFrame(rows, columns=["world", "K", "seed", "cfg", "y", "pred", "hit2", "n", "on"])
+    D.to_csv(os.path.join(sa.RUNS, "kclass_long.csv"), index=False)
+    fair = {c: [w for w in dict.fromkeys(D.world) if w not in set().union(*[FAMILY[b] for b in CFG[c].get("blocks", [])])]
+            if c != "이력만" else list(dict.fromkeys(D.world)) for c in LONG_CFG}
+    lab = lambda lo, hi: f"{lo}~{hi}" if hi < 999 else f"{lo}+"  # noqa: E731
+    L = ["# 긴 사용 기간: 아기 4명을 이어 붙인 가상 아기(울음 약 100개)로 답 수별 정확도", "",
+         "- 아기마다 자기 평균을 빼 목소리 차이를 지우고, 각자의 시간 순서를 지키며 번갈아 넣었다(가정: 아기들의 울음 변화 폭이 비슷).",
+         f"- 가상 아기 5명(울음 15개 이상인 Enes 아기 22명 중 20명을 시드마다 다르게 4명씩) × 시드 {a.seeds}개, "
+         "정답 세계 6가지 중 공정한 세계 평균.",
+         "- 칸 = 1순위 균형 정확도 / 정답이 1·2순위 안에 든 비율(행동별 평균). 괄호 = 그 구간 울음 수(시드·세계 합).", ""]
+    for K in (3, 4):
+        L += [f"## 행동 {K}개 (무작위 {1 / K:.2f} / {2 / K:.2f})", "",
+              "| 설정 | " + " | ".join(f"답 {lab(lo, hi)}개" for lo, hi in LONG_BUCKETS) + " |", "|---|" + "---:|" * len(LONG_BUCKETS)]
+        for c in LONG_CFG:
+            g = D[(D.K == K) & (D.cfg == c) & D.world.isin(fair[c])]
+            cells = []
+            for lo, hi in LONG_BUCKETS:
+                x = g[(g.n >= lo) & (g.n <= hi)]
+                if len(x) < 50:
+                    cells.append("-")
+                    continue
+                t1 = np.mean([sa.bal_np(xx.y, xx.pred) for _, xx in x.groupby(["world", "seed"])])
+                t2 = np.mean([np.mean([xx.hit2[xx.y == k].mean() for k in xx.y.unique()]) for _, xx in x.groupby(["world", "seed"])])
+                on = f", 소리 {x.on.mean():.0%}" if "자가" in c else ""
+                cells.append(f"{t1:.2f} / {t2:.2f} ({len(x)}{on})")
+            L.append(f"| {c} | " + " | ".join(cells) + " |")
+        L.append("")
+    txt = "\n".join(L) + "\n"
+    open(os.path.join(sa.RUNS, "KCLASS_LONG_REPORT.md"), "w", encoding="utf-8").write(txt)
+    print(txt)
+
+
 def main():
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -311,8 +400,11 @@ def main():
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--seeds", type=int, default=3)
     p.add_argument("--perms", type=int, default=20)
+    p = sp.add_parser("long")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--seeds", type=int, default=5)
     a = ap.parse_args()
-    {"feats": cmd_feats, "export": cmd_export, "run": cmd_run}[a.cmd](a)
+    {"feats": cmd_feats, "export": cmd_export, "run": cmd_run, "long": cmd_long}[a.cmd](a)
 
 
 if __name__ == "__main__":

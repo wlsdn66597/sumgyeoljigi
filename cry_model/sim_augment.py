@@ -728,6 +728,181 @@ def cmd_split(a):
     print(txt)
 
 
+# --- 6. 같은 아기: 답이 쌓일수록 (지금 울음을 먼저 맞히고 → 답을 받고 → 다음 울음) -------------------
+BUCKETS = [(1, 4), (5, 9), (10, 14), (15, 19), (20, 29), (30, 99)]
+CURVE_KEYS = ["eps", "seed", "baby", "n", "ans"]
+
+
+def bal_np(yt, yp):
+    """균형 정확도(빠른 판): 정답에 나온 행동마다 맞힌 비율의 평균."""
+    yt, yp = np.asarray(yt), np.asarray(yp)
+    return float(np.mean([np.mean(yp[yt == c] == c) for c in range(3) if (yt == c).any()]))
+
+
+def device_probs(S, yref, ref, qi, method, k=3, temp=3.0):
+    """cry_personal.py의 _proto / _knn과 같은 계산. ref = 답이 있는 이전 울음, qi = 지금 울음."""
+    mu = S[ref, 0].mean(0)
+    z, P, lab = S[qi, 0] - mu, S[ref, 0] - mu, yref[ref]
+    if method == "proto":
+        s = np.full(3, -1.0)
+        for c in range(3):
+            if (lab == c).any():
+                pc = P[lab == c].mean(0)
+                s[c] = z @ pc / (np.linalg.norm(z) * np.linalg.norm(pc) + 1e-9)
+        e = np.exp(temp * (s - s.max()))
+        return e / e.sum()
+    sims = P @ z / (np.linalg.norm(P, axis=1) * np.linalg.norm(z) + 1e-9)
+    top = np.argsort(-sims)[:k]
+    p = np.bincount(lab[top], weights=np.exp(temp * sims[top]), minlength=3) + 0.05
+    return p / p.sum()
+
+
+def cmd_curve(a):
+    """가상 ③(아기마다 다른 규칙) 세계에서 아기마다 울음을 시간순으로 재생한다. 울음마다 그때까지 쌓인 답만으로
+    먼저 맞히고, 그다음 답을 받는다(미래 정보 없음). 모든 울음이 한 번씩 시험이 되므로 6:2:2 한 번보다 시험 수가 많다."""
+    import warnings
+    warnings.filterwarnings("ignore")
+    m, A, E, G, O, VAR, MODES, view = load_all()
+    S0, _ = spaces(m, A, E, view)
+    S = {"YAMNet": S0["YAMNet 16차원(파이 기본)"], "음향 예측": S0["음향 요약 예측(증강으로 배움)"],
+         "YAMNet+음향 예측": S0["YAMNet 16 + 음향 요약 예측(증강)"], "정답 숫자(상한)": S0["실제 음향 요약 6개"]}
+    enes = (m.source == "enes").values
+    rule_b = sorted(b for b, n in m.baby[enes].value_counts().items() if n >= 15)
+    order = {}
+    for b in rule_b:
+        ix = np.where(m.baby.values == b)[0]
+        order[b] = ix[np.lexsort((m.bout.values[ix], m.t.values[ix]))]
+    main = [("YAMNet", "proto"), ("YAMNet", "knn"), ("음향 예측", "proto"), ("음향 예측", "knn")]
+    rec, t0 = [], time.time()
+    for eps in (0.0, 0.3):
+        for seed in range(a.seeds):
+            y = make_labels(m, A[:, 0], "baby", eps, seed)
+            rng = np.random.default_rng(500 + seed)
+            noisy = y.copy()                                       # 부모가 20% 잘못 누른 기록(정답은 그대로)
+            fl = rng.random(len(y)) < 0.2
+            noisy[fl] = (y[fl] + rng.integers(1, 3, fl.sum())) % 3
+            perm = y.copy()                                        # 귀무: 아기 안에서 라벨을 섞어 소리와의 관계를 끊음
+            for ix in order.values():
+                perm[ix] = rng.permutation(perm[ix])
+            scen = [("정확", y, y)] + ([("오답 20%", noisy, y), ("귀무", perm, perm)] if eps == 0 else [])
+            for b, ix in order.items():
+                for t in range(1, len(ix)):
+                    ref, qi = ix[:t], ix[t]
+                    for ans, yref, ytrue in scen:
+                        cfgs = [(s, me) for s in S for me in ("proto", "knn")] if ans == "정확" else main
+                        for s, me in cfgs:
+                            p = device_probs(S[s], yref, ref, qi, me)
+                            rec.append((eps, seed, b, t, ans, s, me, ytrue[qi], int(p.argmax()), float(p.max())))
+                        ph = (np.bincount(yref[ref], minlength=3) + 1.0) / (t + 3)
+                        rec.append((eps, seed, b, t, ans, "이력만", "-", ytrue[qi], int(np.argmax(ph + rng.random(3) * 1e-6)),
+                                    float(ph.max())))
+        print(f"  ε={eps} {time.time() - t0:.0f}s", flush=True)
+    R = pd.DataFrame(rec, columns=CURVE_KEYS + ["space", "method", "y", "pred", "conf"])
+    os.makedirs(RUNS, exist_ok=True)
+    R.to_csv(os.path.join(RUNS, "curve_records.csv"), index=False)
+    report_curve(m, R, order)
+
+
+def boot_ci(D, cols, n=1000, seed=0):
+    """아기 단위 재표집 95% 구간. cols마다 균형 정확도, 마지막에 (cols[0] - cols[1]) 차이."""
+    by = [(g.y.values, [g[c].values for c in cols]) for _, g in D.groupby("baby")]
+    rng = np.random.default_rng(seed)
+    out = []
+    for _ in range(n):
+        pick = rng.integers(0, len(by), len(by))
+        yt = np.concatenate([by[i][0] for i in pick])
+        v = [bal_np(yt, np.concatenate([by[i][1][j] for i in pick])) for j in range(len(cols))]
+        out.append(v + ([v[0] - v[1]] if len(cols) > 1 else []))
+    return np.percentile(np.array(out), [2.5, 97.5], axis=0)
+
+
+def report_curve(m, R, order):
+    H = R[R.space == "이력만"][CURVE_KEYS + ["pred", "conf"]].rename(columns={"pred": "pred_h", "conf": "conf_h"})
+    W = R[R.space != "이력만"].merge(H, on=CURVE_KEYS)
+    bk = lambda n: next(f"{lo}~{hi}" if hi < 99 else f"{lo}+" for lo, hi in BUCKETS if lo <= n <= hi)  # noqa: E731
+    R["bucket"], W["bucket"] = R.n.map(bk), W.n.map(bk)
+    labels = [f"{lo}~{hi}" if hi < 99 else f"{lo}+" for lo, hi in BUCKETS]
+    base = W[(W.eps == 0) & (W.ans == "정확")]
+    cnt = base[(base.space == "YAMNet") & (base.method == "proto") & (base.seed == 0)].groupby("bucket", sort=False)
+    sizes = {k: (g.baby.nunique(), len(g)) for k, g in cnt}
+    L = ["# 같은 아기: 답이 몇 개 쌓이면 쓸 만한가 (가상 ③ 아기마다 다른 규칙)", "",
+         f"- Enes 아기 {len(order)}명(울음 15개 이상)의 울음을 시간순으로 재생. 울음마다 그때까지 쌓인 답으로 먼저 맞히고 답을 받는다.",
+         "- 소리 비교는 cry_personal.py와 같은 계산(proto: 행동별 평균과 코사인 / knn: 가까운 3개 투표). 균형 정확도, 시드 5개.",
+         "- 괄호 = 아기 단위 재표집 95% 구간. 이력만 = 지금까지 가장 많이 받은 답을 그대로 찍기.", "",
+         "칸별 크기(아기 수 / 시험 울음 수, 시드 하나): " + ", ".join(f"답 {k}개 {v[0]}명/{v[1]}" for k, v in sizes.items()), "",
+         "## 1. 답 수별 정확도 (부모가 정확히 답함)", "",
+         "| 비교 공간 | 방법 | " + " | ".join(f"답 {b}개" for b in labels) + " |", "|---|---|" + "---:|" * len(labels)]
+
+    def cell(D, cols=("pred",)):
+        if len(D) < 30:
+            return "-"
+        ci = boot_ci(D, list(cols), n=400)
+        return f"{bal_np(D.y, D[cols[0]]):.2f} ({ci[0][0]:.2f}~{ci[1][0]:.2f})"
+    for (s, me), g in base.groupby(["space", "method"], sort=False):
+        L.append(f"| {s} | {me} | " + " | ".join(cell(g[g.bucket == b]) for b in labels) + " |")
+    g = base[(base.space == "YAMNet") & (base.method == "proto")]
+    L.append("| 이력만 | - | " + " | ".join(cell(g[g.bucket == b], ("pred_h",)) for b in labels) + " |")
+    nul = W[(W.eps == 0) & (W.ans == "귀무")]
+    for s, me in (("YAMNet", "knn"), ("음향 예측", "knn")):
+        g = nul[(nul.space == s) & (nul.method == me)]
+        L.append(f"| 귀무(라벨 섞음) {s} | {me} | " + " | ".join(cell(g[g.bucket == b]) for b in labels) + " |")
+
+    L += ["", "## 2. 이력만보다 확실히 나아지는 시점 (차이의 95% 구간이 0보다 큼)", "",
+          "| 비교 공간 | 방법 | " + " | ".join(f"답 {b}개" for b in labels) + " | 처음 넘는 구간 |", "|---|---|" + "---:|" * (len(labels) + 1)]
+    for s, me in [("YAMNet", "proto"), ("YAMNet", "knn"), ("음향 예측", "proto"), ("음향 예측", "knn"),
+                  ("YAMNet+음향 예측", "proto"), ("YAMNet+음향 예측", "knn")]:
+        g = base[(base.space == s) & (base.method == me)]
+        cells, first = [], "-"
+        for b in labels:
+            D = g[g.bucket == b]
+            if len(D) < 30:
+                cells.append("-")
+                continue
+            ci = boot_ci(D, ["pred", "pred_h"], n=400)
+            d = bal_np(D.y, D.pred) - bal_np(D.y, D.pred_h)
+            cells.append(f"{d:+.2f} ({ci[0][2]:+.2f}~{ci[1][2]:+.2f})")
+            if first == "-" and ci[0][2] > 0:
+                first = f"답 {b}개"
+        L.append(f"| {s} | {me} | " + " | ".join(cells) + f" | {first} |")
+
+    L += ["", "## 3. 답이 불완전할 때 (답 10개 이상 쌓인 뒤)", "",
+          "| 비교 공간 | 방법 | 정확한 답 | 부모 오답 20% | 원인 자체가 30% 무작위(ε=0.3) |", "|---|---|---:|---:|---:|"]
+    for s, me in [("YAMNet", "proto"), ("YAMNet", "knn"), ("음향 예측", "proto"), ("음향 예측", "knn")]:
+        v = []
+        for eps, ans in ((0.0, "정확"), (0.0, "오답 20%"), (0.3, "정확")):
+            D = W[(W.eps == eps) & (W.ans == ans) & (W.space == s) & (W.method == me) & (W.n >= 10)]
+            v.append(f"{bal_np(D.y, D.pred):.3f}")
+        L.append(f"| {s} | {me} | " + " | ".join(v) + " |")
+
+    L += ["", "## 4. 확신할 때만 보여주면 (답 10개 이상, 부모가 정확히 답함)", "",
+          "확신도 = 힌트 확률의 최댓값. 확신도 높은 순으로 보여줄 비율을 정했을 때, 보여준 힌트가 맞은 비율.", "",
+          "| 비교 공간 | 방법 | 다 보여줌 | 70%만 | 50%만 | 30%만 |", "|---|---|---:|---:|---:|---:|"]
+    for s, me in [("YAMNet", "proto"), ("YAMNet", "knn"), ("음향 예측", "proto"), ("음향 예측", "knn")]:
+        D = base[(base.space == s) & (base.method == me) & (base.n >= 10)]
+        v = []
+        for cov in (1.0, 0.7, 0.5, 0.3):
+            thr = D.conf.quantile(1 - cov) if cov < 1 else -1
+            shown = D[D.conf >= thr] if cov < 1 else D
+            v.append(f"{(shown.y == shown.pred).mean():.2f}")
+        L.append(f"| {s} | {me} | " + " | ".join(v) + " |")
+
+    en = m[m.source == "enes"]
+    per = []
+    for b, g in en.groupby("baby"):
+        days = np.unique(np.floor(g.t.values / 86400)).size
+        span = (g.t.max() - g.t.min()) / 86400 + 1
+        per.append((len(g), days, len(g) / days, len(g) / span))
+    per = np.array(per)
+    L += ["", "## 5. Enes 기록의 울음 빈도 (참고)", "",
+          f"- 아기당 울음 {np.median(per[:, 0]):.0f}개(중앙값), 녹음한 날 {np.median(per[:, 1]):.0f}일, "
+          f"녹음한 날 하루 {np.median(per[:, 2]):.1f}회(사분위 {np.percentile(per[:, 2], 25):.1f}~{np.percentile(per[:, 2], 75):.1f}), "
+          f"첫날~마지막 날 기준 하루 {np.median(per[:, 3]):.1f}회.",
+          "- 부모가 녹음한 울음만 들어 있어 실제 울음 횟수보다 적을 수 있다."]
+    txt = "\n".join(L) + "\n"
+    open(os.path.join(RUNS, "CURVE_REPORT.md"), "w", encoding="utf-8").write(txt)
+    print(txt)
+
+
 def main():
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -741,8 +916,10 @@ def main():
     p.add_argument("--perms", type=int, default=20)
     p = sp.add_parser("split")
     p.add_argument("--seeds", type=int, default=5)
+    p = sp.add_parser("curve")
+    p.add_argument("--seeds", type=int, default=5)
     a = ap.parse_args()
-    {"prep": cmd_prep, "run": cmd_run, "split": cmd_split}[a.cmd](a)
+    {"prep": cmd_prep, "run": cmd_run, "split": cmd_split, "curve": cmd_curve}[a.cmd](a)
 
 
 if __name__ == "__main__":

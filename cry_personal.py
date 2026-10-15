@@ -161,9 +161,11 @@ class CryPersonal:
                 p = p * p_sound ** self.w_sound
         p = p / p.sum()
         top = int(np.argmax(p))
+        top2 = [ACTIONS[i] for i in np.argsort(-p)[:2]]           # 먼저 해 볼 1·2순위(행동 3개 중 2개)
         since_feed = None if self.last_feed is None else round((t - self.last_feed) / 3600, 1)
         return {"probs": {a: round(float(v), 3) for a, v in zip(ACTIONS, p)}, "top": ACTIONS[top],
                 "top_ko": LABEL_KO[ACTIONS[top]], "confidence": round(float(p[top]), 3),
+                "top2": top2, "top2_ko": [LABEL_KO[a] for a in top2], "top2_conf": round(float(np.sort(p)[-2:].sum()), 3),
                 "show": bool(len(labeled) >= self.k_min and p[top] >= self.show_min),
                 "n_feedback": len(labeled), "hours_since_feed": since_feed, "sound_on": sound_on,
                 "recent": check, "parts": {k: [round(float(x), 3) for x in v] for k, v in parts.items()}}

@@ -269,6 +269,9 @@ def cmd_export(_):
     print(f"저장 {out}: 1024 → {len(names)}, 규제 {p['alpha']:.0f}, 처음 보는 그룹 R² {r2:.2f}")
 
 
+COLS = ["bal", "on", "top2", "top2_10", "top2_20"]
+
+
 def cmd_device(a):
     """../cry_personal.py를 그대로 시간순 재생해 설정을 비교한다(답 10개 이상 쌓인 뒤 힌트의 균형 정확도).
     가상 ③ 세계 4개(유형 크기 균등)와 실제 Enes 라벨. 맥락 모델은 쓰지 않는다(이력 × 소리만 비교)."""
@@ -288,21 +291,19 @@ def cmd_device(a):
     cfgs = {"이력만(소리 안 씀)": dict(w_sound=0.0),
             "YAMNet 16, 소리 항상": dict(gate=False),
             "음향 변환, 소리 항상": dict(acoustic=ac, gate=False),
-            "음향 변환 + 자가 검증(기록 10, 비교 10, +1)": dict(acoustic=ac, track_from=10, gate_n=10, gate_margin=1),
-            "음향 변환 + 자가 검증(기록 5, 비교 6, +1)": dict(acoustic=ac, track_from=5, gate_n=6, gate_margin=1),
-            "음향 변환 + 자가 검증(기록 5, 비교 8, +2)": dict(acoustic=ac, track_from=5, gate_n=8, gate_margin=2),
-            "음향 변환 + 자가 검증(기록 3, 비교 5, +1)": dict(acoustic=ac, track_from=3, gate_n=5, gate_margin=1)}
+            "음향 변환 + 자가 검증(기본)": dict(acoustic=ac)}
 
     def run(y, babies):
+        """반환: {설정: (상위 1개 균형 정확도, 소리 켜진 비율, 상위 2개 적중률 — 답 10개 이상 / 10~19개 / 20개 이상)}.
+        상위 2개 적중률은 정답 행동마다 낸 뒤 평균(균형)."""
         out = {}
         for name, kw in cfgs.items():
-            yt, yp, on = [], [], []
+            yt, yp, on, hit2, nf = [], [], [], [], []
             for bb in babies:
                 ix = np.where(m.baby.values == bb)[0]
                 ix = ix[np.lexsort((m.bout.values[ix], m.t.values[ix]))]
                 dev = cp.CryPersonal(basis, None, acoustic_path=kw.get("acoustic"), w_sound=kw.get("w_sound", 1.0),
-                                     gate=kw.get("gate", True), hint_seconds=10, track_from=kw.get("track_from", 10),
-                                     gate_n=kw.get("gate_n", 10), gate_margin=kw.get("gate_margin", 1))
+                                     gate=kw.get("gate", True), hint_seconds=10)
                 for i in ix:
                     t = float(m.t.values[i])
                     h = dev.hint(t, embs=[E[i, 0]])
@@ -310,10 +311,16 @@ def cmd_device(a):
                         yt.append(y[i])
                         yp.append(cp.ACTIONS.index(h["top"]))
                         on.append(h["sound_on"])
+                        hit2.append(cp.ACTIONS[y[i]] in h["top2"])
+                        nf.append(h["n_feedback"])
                     dev.start(t)
                     dev.add_window(E[i, 0])
                     dev.feedback(dev.end(t + 60), cp.ACTIONS[y[i]])
-            out[name] = (sa.bal_np(yt, yp), float(np.mean(on)))
+            yt, hit2, nf = np.array(yt), np.array(hit2), np.array(nf)
+
+            def top2(sel):
+                return float(np.mean([hit2[sel & (yt == c)].mean() for c in range(3) if (sel & (yt == c)).any()]))
+            out[name] = (sa.bal_np(yt, yp), float(np.mean(on)), top2(nf >= 10), top2(nf < 20), top2(nf >= 20))
         return out
 
     T, _ = acoustic_targets(m, A, f)
@@ -321,20 +328,20 @@ def cmd_device(a):
     rows, t0 = [], time.time()
     for wname, F in worlds.items():
         for seed in range(a.seeds):
-            for name, (v, on) in run(baby_rule(m, F, rule_b, seed), rule_b).items():
-                rows.append({"label": f"가상: {wname}", "seed": seed, "cfg": name, "bal": v, "on": on})
+            for name, r in run(baby_rule(m, F, rule_b, seed), rule_b).items():
+                rows.append({"label": f"가상: {wname}", "seed": seed, "cfg": name, **dict(zip(COLS, r))})
         print(f"  {wname} {time.time() - t0:.0f}s", flush=True)
     real = np.array(["FIS".index(s) if s in ("F", "I", "S") else 0 for s in m.stop])
-    for name, (v, on) in run(real, all_b).items():
-        rows.append({"label": "실제 Enes", "seed": 0, "cfg": name, "bal": v, "on": on})
+    for name, r in run(real, all_b).items():
+        rows.append({"label": "실제 Enes", "seed": 0, "cfg": name, **dict(zip(COLS, r))})
     rng = np.random.default_rng(3)
     for r_ in range(a.perms):
         yp = real.copy()
         for bb in all_b:
             ix = np.where(m.baby.values == bb)[0]
             yp[ix] = rng.permutation(yp[ix])
-        for name, (v, on) in run(yp, all_b).items():
-            rows.append({"label": "실제 Enes 귀무", "seed": r_, "cfg": name, "bal": v, "on": on})
+        for name, r in run(yp, all_b).items():
+            rows.append({"label": "실제 Enes 귀무", "seed": r_, "cfg": name, **dict(zip(COLS, r))})
     D = pd.DataFrame(rows)
     D.to_csv(os.path.join(sa.RUNS, "device_replay.csv"), index=False)
     L = ["# 파이 모듈(cry_personal.py) 그대로 재생: 답 10개 이상 쌓인 뒤 힌트 균형 정확도", "",
@@ -346,6 +353,16 @@ def cmd_device(a):
             g = D[(D.label == lab) & (D.cfg == name)]
             v = g.bal.quantile(0.95) if lab.endswith("귀무") else g.bal.mean()
             cells.append(f"{v:.3f} ({g.on.mean():.0%})")
+        L.append(f"| {name} | " + " | ".join(cells) + " |")
+    L += ["", "## 상위 2개 안에 정답이 있을 확률 (정답 행동마다 낸 뒤 평균. 아무렇게나 2개 고르면 0.667)", "",
+          "칸 = 답 10개 이상 전체 (답 10~19개 / 20개 이상). 귀무는 95%.", "",
+          "| 설정 | " + " | ".join(dict.fromkeys(D.label)) + " |", "|---|" + "---:|" * D.label.nunique()]
+    for name in cfgs:
+        cells = []
+        for lab in dict.fromkeys(D.label):
+            g = D[(D.label == lab) & (D.cfg == name)]
+            q = (lambda c: g[c].quantile(0.95)) if lab.endswith("귀무") else (lambda c: g[c].mean())
+            cells.append(f"{q('top2'):.3f} ({q('top2_10'):.2f} / {q('top2_20'):.2f})")
         L.append(f"| {name} | " + " | ".join(cells) + " |")
     txt = "\n".join(L) + "\n"
     open(os.path.join(sa.RUNS, "DEVICE_REPLAY.md"), "w", encoding="utf-8").write(txt)

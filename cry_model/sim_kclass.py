@@ -304,18 +304,19 @@ def report(D):
 # --- 4. 긴 사용 기간: 아기 여럿을 이어 붙인 가상 아기 ----------------------------------------------
 LONG_CFG = ["이력만", "YAMNet 16", "음향 변환 + MFCC", "음향 변환 + MFCC, 자가 검증"]
 LONG_BUCKETS = [(10, 19), (20, 39), (40, 59), (60, 79), (80, 999)]
+LONG_BUCKETS_BIG = [(10, 19), (20, 39), (40, 79), (80, 119), (120, 159), (160, 199), (200, 999)]
 
 
 def _long_task(job):
-    """Enes 아기 4명씩 묶어 울음 약 100개짜리 가상 아기를 만든다. 아기마다 자기 평균을 빼(목소리 차이 제거) 같은
+    """Enes 아기 gsize명씩 묶어 가상 아기를 만든다(4명이면 울음 약 100개, 11명이면 약 280개). 아기마다 자기 평균을 빼(목소리 차이 제거) 같은
     아기 안의 차이만 남기고, 각자의 시간 순서를 지키며 번갈아 넣는다. 반환: 울음마다 (설정, 정답, 1순위, 2순위 적중, 답 수)."""
-    world, K, seed = job
+    world, K, seed, gsize = job
     m, E0, MS = _W["m"], _W["E0"], _W["MS"]
     order = _W["order"]
     rng = np.random.default_rng(seed)
     babies = list(order)
     rng.shuffle(babies)
-    groups = [babies[i:i + 4] for i in range(0, len(babies) - len(babies) % 4, 4)]
+    groups = [babies[i:i + gsize] for i in range(0, len(babies) - len(babies) % gsize, gsize)]
     En, Mn, Fn = E0.copy(), MS.copy(), _W["worlds"][world].copy()
     gE, gM = E0[np.concatenate(list(order.values()))].mean(0), MS[np.concatenate(list(order.values()))].mean(0)
     for ix in order.values():                                 # 아기마다 평균을 빼고 전체 평균을 더한다
@@ -350,8 +351,10 @@ def cmd_long(a):
     import warnings
     from multiprocessing import Pool
     warnings.filterwarnings("ignore")
-    jobs = [(w, K, s) for w in ("요약 6", "eGeMAPS", "MFCC", "YAMNet", "스펙트럼 모양", "리듬") for K in (3, 4)
+    jobs = [(w, K, s, a.group) for w in ("요약 6", "eGeMAPS", "MFCC", "YAMNet", "스펙트럼 모양", "리듬") for K in (3, 4)
             for s in range(a.seeds)]
+    buckets = LONG_BUCKETS if a.group <= 4 else LONG_BUCKETS_BIG
+    tag = "" if a.group == 4 else f"_g{a.group}"
     rows, t0 = [], time.time()
     with Pool(a.workers, initializer=_init_run) as pool:
         for n, r in enumerate(pool.imap_unordered(_long_task, jobs)):
@@ -359,22 +362,23 @@ def cmd_long(a):
             if (n + 1) % 12 == 0:
                 print(f"  {n + 1}/{len(jobs)} {time.time() - t0:.0f}s", flush=True)
     D = pd.DataFrame(rows, columns=["world", "K", "seed", "cfg", "y", "pred", "hit2", "n", "on"])
-    D.to_csv(os.path.join(sa.RUNS, "kclass_long.csv"), index=False)
+    D.to_csv(os.path.join(sa.RUNS, f"kclass_long{tag}.csv"), index=False)
+    nb = 22 // a.group
     fair = {c: [w for w in dict.fromkeys(D.world) if w not in set().union(*[FAMILY[b] for b in CFG[c].get("blocks", [])])]
             if c != "이력만" else list(dict.fromkeys(D.world)) for c in LONG_CFG}
     lab = lambda lo, hi: f"{lo}~{hi}" if hi < 999 else f"{lo}+"  # noqa: E731
-    L = ["# 긴 사용 기간: 아기 4명을 이어 붙인 가상 아기(울음 약 100개)로 답 수별 정확도", "",
+    L = [f"# 긴 사용 기간: 아기 {a.group}명을 이어 붙인 가상 아기(울음 약 {25 * a.group}개)로 답 수별 정확도", "",
          "- 아기마다 자기 평균을 빼 목소리 차이를 지우고, 각자의 시간 순서를 지키며 번갈아 넣었다(가정: 아기들의 울음 변화 폭이 비슷).",
-         f"- 가상 아기 5명(울음 15개 이상인 Enes 아기 22명 중 20명을 시드마다 다르게 4명씩) × 시드 {a.seeds}개, "
+         f"- 가상 아기 {nb}명(울음 15개 이상인 Enes 아기 22명 중 {nb * a.group}명을 시드마다 다르게 {a.group}명씩) × 시드 {a.seeds}개, "
          "정답 세계 6가지 중 공정한 세계 평균.",
          "- 칸 = 1순위 균형 정확도 / 정답이 1·2순위 안에 든 비율(행동별 평균). 괄호 = 그 구간 울음 수(시드·세계 합).", ""]
     for K in (3, 4):
         L += [f"## 행동 {K}개 (무작위 {1 / K:.2f} / {2 / K:.2f})", "",
-              "| 설정 | " + " | ".join(f"답 {lab(lo, hi)}개" for lo, hi in LONG_BUCKETS) + " |", "|---|" + "---:|" * len(LONG_BUCKETS)]
+              "| 설정 | " + " | ".join(f"답 {lab(lo, hi)}개" for lo, hi in buckets) + " |", "|---|" + "---:|" * len(buckets)]
         for c in LONG_CFG:
             g = D[(D.K == K) & (D.cfg == c) & D.world.isin(fair[c])]
             cells = []
-            for lo, hi in LONG_BUCKETS:
+            for lo, hi in buckets:
                 x = g[(g.n >= lo) & (g.n <= hi)]
                 if len(x) < 50:
                     cells.append("-")
@@ -386,7 +390,7 @@ def cmd_long(a):
             L.append(f"| {c} | " + " | ".join(cells) + " |")
         L.append("")
     txt = "\n".join(L) + "\n"
-    open(os.path.join(sa.RUNS, "KCLASS_LONG_REPORT.md"), "w", encoding="utf-8").write(txt)
+    open(os.path.join(sa.RUNS, f"KCLASS_LONG_REPORT{tag}.md"), "w", encoding="utf-8").write(txt)
     print(txt)
 
 
@@ -403,6 +407,7 @@ def main():
     p = sp.add_parser("long")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--seeds", type=int, default=5)
+    p.add_argument("--group", type=int, default=4, help="가상 아기 하나에 묶을 Enes 아기 수")
     a = ap.parse_args()
     {"feats": cmd_feats, "export": cmd_export, "run": cmd_run, "long": cmd_long}[a.cmd](a)
 

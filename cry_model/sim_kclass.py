@@ -39,7 +39,7 @@ CFG = {"이력만": dict(w_sound=0.0, blocks=["acoustic"]),
        "음향 변환 + MFCC": dict(blocks=["acoustic", "mfcc"], gate=False),
        "YAMNet 16 + MFCC": dict(blocks=["yamnet16", "mfcc"], gate=False),
        "음향 변환 + MFCC, 자가 검증": dict(blocks=["acoustic", "mfcc"], gate=True)}
-FAMILY = {"yamnet16": {"YAMNet"}, "acoustic": {"요약 6", "eGeMAPS", "MFCC"}, "mfcc": {"MFCC"}}
+FAMILY = {"yamnet16": {"YAMNet"}, "acoustic": {"요약 6", "eGeMAPS", "MFCC"}, "mfcc": {"MFCC"}, "rhythm": {"리듬"}}
 _W = {}
 
 
@@ -80,7 +80,7 @@ def _feat_one(job):
         cry.append(max(sc[19], sc[20]) >= sa.CRY_THR)
     use = [w for w, c in zip(wins, cry) if c] or wins
     fr = [cp.mfcc_frames(w, _W["fb"]) for w in use]
-    ms = cp.mfcc_stats(np.concatenate([f[0] for f in fr]), np.concatenate([f[1] for f in fr]))
+    ms = cp.audio_stats(np.concatenate([f[0] for f in fr]), np.concatenate([f[1] for f in fr]))   # MFCC 40 + 리듬 8
     xs = np.pad(x, (0, max(0, sa.SR - len(x))))
     return k, ms.astype(np.float32), spectral_shape(xs).astype(np.float32)
 
@@ -101,7 +101,7 @@ def rhythm(m):
 def cmd_feats(a):
     from multiprocessing import Pool
     m = sa.items()
-    MS = np.zeros((len(m), 40), np.float32)
+    MS = np.zeros((len(m), 48), np.float32)
     SP = np.zeros((len(m), 22), np.float32)
     t0 = time.time()
     with Pool(a.workers, initializer=_init_feats) as pool:
@@ -110,7 +110,8 @@ def cmd_feats(a):
             if (n + 1) % 500 == 0:
                 print(f"  {n + 1}/{len(m)} {time.time() - t0:.0f}s", flush=True)
     m2 = pd.read_csv(os.path.join(sa.OUT, "items.csv"))
-    np.savez(FEATS2, mfcc_dev=MS, spec=np.nan_to_num(SP), rhythm=rhythm(m2))
+    np.savez(FEATS2, mfcc_dev=MS[:, :40], rhythm_dev=np.nan_to_num(MS[:, 40:]), spec=np.nan_to_num(SP),
+             rhythm=rhythm(m2))
     print(f"저장 {FEATS2} {time.time() - t0:.0f}s", flush=True)
 
 
@@ -131,16 +132,19 @@ def cmd_export(_):
     f = np.load(FEATS2)
     z = dict(np.load(ACOUSTIC_NPZ))
     pub = (m.source != "enes").values
-    MS = f["mfcc_dev"].astype(float)
+    MS = np.c_[f["mfcc_dev"], f["rhythm_dev"]].astype(float)
+    z["rhythm_mean"] = MS[pub, 40:].mean(0).astype(np.float32)
+    z["rhythm_std"] = (MS[pub, 40:].std(0) + 1e-6).astype(np.float32)
     z["mel_fb"] = librosa.filters.mel(sr=sa.SR, n_fft=cp.N_FFT).astype(np.float32)
-    z["mfcc_mean"], z["mfcc_std"] = MS[pub].mean(0).astype(np.float32), (MS[pub].std(0) + 1e-6).astype(np.float32)
-    for k in ("spread_yamnet16", "spread_acoustic", "spread_mfcc"):
+    z["mfcc_mean"] = MS[pub, :40].mean(0).astype(np.float32)
+    z["mfcc_std"] = (MS[pub, :40].std(0) + 1e-6).astype(np.float32)
+    for k in ("spread_yamnet16", "spread_acoustic", "spread_mfcc", "spread_rhythm"):
         z.pop(k, None)
     b = np.load(os.path.join(sa.ART, "cry_personal_basis.npz"))
     dev = cp.CryPersonal({k: b[k] for k in ("mean", "std", "pca")}, None, acoustic_path=z,
-                         blocks=["yamnet16", "acoustic", "mfcc"])
+                         blocks=["yamnet16", "acoustic", "mfcc", "rhythm"])
     order = enes_order(m, min_n=2)
-    for blk in ("yamnet16", "acoustic", "mfcc"):
+    for blk in ("yamnet16", "acoustic", "mfcc", "rhythm"):
         dev.blocks, dev.w[blk] = [blk], 1.0
         Z = np.array([dev._project(E[i, 0], MS[i]) for i in range(len(m))])
         d = np.concatenate([Z[ix] - Z[ix].mean(0) for ix in order.values()])
@@ -179,7 +183,8 @@ def _init_run():
     m, A, E, G, O, VAR, MODES, view = sa.load_all()
     f, f2 = np.load(ss.FEATS), np.load(FEATS2)
     b = np.load(os.path.join(sa.ART, "cry_personal_basis.npz"))
-    _W.update(m=m, E0=E[:, 0].copy(), MS=f2["mfcc_dev"].astype(float), basis={k: b[k] for k in ("mean", "std", "pca")},
+    MS = np.c_[f2["mfcc_dev"], f2["rhythm_dev"]] if "rhythm_dev" in f2 else f2["mfcc_dev"]
+    _W.update(m=m, E0=E[:, 0].copy(), MS=MS.astype(float), basis={k: b[k] for k in ("mean", "std", "pca")},
               ac=dict(np.load(ACOUSTIC_NPZ)), order=enes_order(m),
               worlds={"요약 6": A[:, 0].copy(), "eGeMAPS": f["egemaps"].astype(float), "MFCC": f2["mfcc_dev"].astype(float),
                       "YAMNet": E[:, 0].copy(), "스펙트럼 모양": f2["spec"].astype(float), "리듬": f2["rhythm"]})
@@ -405,7 +410,7 @@ MORE_ANS = {"답 100%": (1.0, False, False), "답 50%": (0.5, False, False), "�
 POS_BUCKETS = [(20, 39), (40, 59), (60, 79), (80, 999)]
 
 
-def replay_more(y, actions, vorder, En, Mn, seed, cfgs, answers):
+def replay_more(y, actions, vorder, En, Mn, seed, cfgs, answers, cfgdict=None):
     """가상 부모: 울음마다 p_full 확률로 최종 답. 답을 안 한 울음에서 힌트가 보였고 1순위가 틀렸으면 '아니었어요'.
     답 여부는 울음마다 미리 뽑아 설정 간에 같다. 반환: (설정, 답 방식, 정답, 1순위, 2순위 적중, 몇 번째 울음, 소리 켜짐)."""
     rec = []
@@ -417,7 +422,7 @@ def replay_more(y, actions, vorder, En, Mn, seed, cfgs, answers):
                 if aname not in ("답 100%", "답 50%") and cname in ("이력만", "proto + 자가 검증(지금 기본)"):
                     continue
                 dev = cp.CryPersonal(_W["basis"], None, acoustic_path=_W["ac"], actions=actions, hint_seconds=10,
-                                     use_not=use_not, semi=semi, **MORE_CFG[cname])
+                                     use_not=use_not, semi=semi, **(cfgdict or MORE_CFG)[cname])
                 for pos, i in enumerate(ix):
                     t = 1.7e9 + pos * 3600.0
                     h = dev.hint(t, embs=[En[i]], mfcc=Mn[i])
@@ -534,6 +539,79 @@ def report_more(D):
     print(txt)
 
 
+# --- 6. 리듬·시간 특징 블록 ----------------------------------------------------------
+RHY_CFG = {"이력만": dict(w_sound=0.0),
+           "음향+MFCC (지금)": dict(blocks=["acoustic", "mfcc"], gate=False),
+           "음향+MFCC+리듬": dict(blocks=["acoustic", "mfcc", "rhythm"], gate=False),
+           "리듬만": dict(blocks=["rhythm"], gate=False),
+           "음향+MFCC, 자가 검증 (지금 기본)": dict(blocks=["acoustic", "mfcc"]),
+           "음향+MFCC+리듬, 자가 검증": dict(blocks=["acoustic", "mfcc", "rhythm"])}
+
+
+def _rhy_task(job):
+    kind, world, seed = job
+    m = _W["m"]
+    if kind == "sim":
+        vorder, En, Mn, Fn = _virtual(world, seed, 4)
+        y = baby_rule(m, Fn, vorder, 3, None, seed)
+        rec = replay_more(y, cp.ACTIONS3, vorder, En, Mn, seed, list(RHY_CFG), ["답 100%"], RHY_CFG)
+    else:
+        order = enes_order(m, min_n=2)
+        y = np.array(["FIS".index(s) if s in ("F", "I", "S") else 0 for s in m.stop.astype(str)])
+        if seed:
+            rng = np.random.default_rng(seed)
+            for ix in order.values():
+                y[ix] = rng.permutation(y[ix])
+        rec = replay_more(y, cp.ACTIONS3, order, _W["E0"], _W["MS"], seed, list(RHY_CFG), ["답 100%"], RHY_CFG)
+    return [(kind, world, seed) + r for r in rec]
+
+
+def cmd_rhythm(a):
+    import warnings
+    from multiprocessing import Pool
+    warnings.filterwarnings("ignore")
+    jobs = [("sim", w, s) for w in ("요약 6", "eGeMAPS", "MFCC", "YAMNet", "스펙트럼 모양", "리듬") for s in range(a.seeds)]
+    jobs += [("real", "실제 Enes", s) for s in range(a.perms + 1)]
+    rows, t0 = [], time.time()
+    with Pool(a.workers, initializer=_init_run) as pool:
+        for n, r in enumerate(pool.imap_unordered(_rhy_task, jobs)):
+            rows += r
+            if (n + 1) % 12 == 0:
+                print(f"  {n + 1}/{len(jobs)} {time.time() - t0:.0f}s", flush=True)
+    D = pd.DataFrame(rows, columns=["kind", "world", "seed", "cfg", "ans", "y", "pred", "hit2", "pos", "on"])
+    D.to_csv(os.path.join(sa.RUNS, "kclass_rhythm.csv"), index=False)
+    lab = lambda lo, hi: f"{lo}~{hi}" if hi < 999 else f"{lo}+"  # noqa: E731
+    L = ["# 리듬·시간 특징 블록 (행동 3개, 가상 아기 울음 약 100개, 답 100%)", "",
+         "- 리듬 8개 = 프레임 세기에서 소리 나는 비율, 초당 덩어리 수, 덩어리·쉼 길이와 변동, 세기 기울기, 세기 폭.",
+         "- 공정 = YAMNet·스펙트럼 모양 세계(어떤 블록과도 무관). 리듬 세계 = Enes 메타(음절 속도·쉼·유성·울음 길이)로 만든",
+         "  정답이라 리듬 블록과 개념이 겹친다('배울 수 있는가' 확인용). 칸 = 1순위 / 2순위 안(무작위 0.33 / 0.67).", ""]
+    groups = (("공정한 세계 (YAMNet·스펙트럼 모양)", ["YAMNet", "스펙트럼 모양"]), ("리듬 세계", ["리듬"]),
+              ("음향 특징 세계 (요약 6·eGeMAPS·MFCC, 음향+MFCC에는 순환)", ["요약 6", "eGeMAPS", "MFCC"]))
+    for title, ws in groups:
+        S = D[(D.kind == "sim") & D.world.isin(ws)]
+        L += [f"## {title}", "",
+              "| 방법 | " + " | ".join(f"울음 {lab(lo, hi)}번째" for lo, hi in POS_BUCKETS) + " | 소리 켜짐 |",
+              "|---|" + "---:|" * (len(POS_BUCKETS) + 1)]
+        for c in RHY_CFG:
+            g = S[S.cfg == c]
+            cells = ["%.2f / %.2f" % _score(g[(g.pos >= lo) & (g.pos <= hi)]) for lo, hi in POS_BUCKETS]
+            on = f"{g[g.pos >= 20].on.mean():.0%}" if "자가" in c else "-"
+            L.append(f"| {c} | " + " | ".join(cells) + f" | {on} |")
+        L.append("")
+    R = D[D.kind == "real"]
+    L += ["## 실제 Enes (아기 24명, 11번째 울음부터)", "", "| 방법 | 실제 | 귀무 95% | 소리 켜짐 |", "|---|---:|---:|---:|"]
+    for c in RHY_CFG:
+        x = R[(R.cfg == c) & (R.pos >= 10)]
+        r1, r2 = _score(x[x.seed == 0])
+        nul = [_score(g) for _, g in x[x.seed > 0].groupby("seed")]
+        on = f"{x[x.seed == 0].on.mean():.0%}" if "자가" in c else "-"
+        L.append(f"| {c} | {r1:.3f} / {r2:.3f} | {np.quantile([v[0] for v in nul], .95):.3f} / "
+                 f"{np.quantile([v[1] for v in nul], .95):.3f} | {on} |")
+    txt = "\n".join(L) + "\n"
+    open(os.path.join(sa.RUNS, "KCLASS_RHYTHM_REPORT.md"), "w", encoding="utf-8").write(txt)
+    print(txt)
+
+
 def main():
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -552,8 +630,13 @@ def main():
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--seeds", type=int, default=6)
     p.add_argument("--perms", type=int, default=20)
+    p = sp.add_parser("rhythm")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--seeds", type=int, default=6)
+    p.add_argument("--perms", type=int, default=20)
     a = ap.parse_args()
-    {"feats": cmd_feats, "export": cmd_export, "run": cmd_run, "long": cmd_long, "more": cmd_more}[a.cmd](a)
+    {"feats": cmd_feats, "export": cmd_export, "run": cmd_run, "long": cmd_long, "more": cmd_more,
+     "rhythm": cmd_rhythm}[a.cmd](a)
 
 
 if __name__ == "__main__":

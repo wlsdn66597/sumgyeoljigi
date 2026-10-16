@@ -155,7 +155,7 @@ def cmd_ctx(_):
 
 # --- 재생 ---------------------------------------------------------------------------
 def replay(rows, X, basis, ctxs, hint_s, p_answer, noise, seed, labels, half_life=None, w_sound=1.0,
-           proto_from="all", sound_method="proto"):
+           proto_from="all", sound_method="proto", **kw):
     """아기마다 새 CryPersonal을 만들어 울음을 시간순으로 넣는다. 반환: 평가 대상 울음(이전 울음 10개 이상)의 기록."""
     rng = np.random.default_rng(seed)
     rec = []
@@ -165,7 +165,7 @@ def replay(rows, X, basis, ctxs, hint_s, p_answer, noise, seed, labels, half_lif
     for bb, ks in by.items():
         bs = basis[bb] if bb in basis else basis
         dev = cp.CryPersonal(bs, ctxs[bb], actions=cp.ACTIONS3, k_min=K_MIN, hint_seconds=hint_s or 10 ** 6, half_life=half_life,
-                             w_sound=w_sound, proto_from=proto_from, sound_method=sound_method)
+                             w_sound=w_sound, proto_from=proto_from, sound_method=sound_method, **kw)
         for n, k in enumerate(ks):
             r = rows[k]
             y = labels[k]
@@ -371,6 +371,47 @@ def cmd_tune(a):
     print(txt)
 
 
+def cmd_ctxp(a):
+    """아기별 맥락(이 아기의 답으로 다시 배운 맥락 모델) vs 공통 맥락. 실제 Enes, 힌트 10초, 매번 답, 소리 안 섞음.
+    공통 모델은 평가하는 아기를 뺀 아기들로 학습(한 아기씩 빼기). 귀무 = 아기 안 라벨 섞기."""
+    rows, X = bouts()
+    b = np.load(os.path.join(ART, "cry_personal_basis.npz"))
+    basis = {"mean": b["mean"], "std": b["std"], "pca": b["pca"]}
+    ctxs = {bb: ctx_train(rows, exclude=bb) for bb in sorted(set(r["baby"] for r in rows))}
+    y_true = np.array([r["y"] for r in rows])
+    cfgs = {"공통 맥락": dict(ctx_mode="global")}
+    for lam in (1.0, 3.0, 10.0):
+        cfgs[f"아기별 맥락(당김 {lam:g})"] = dict(ctx_mode="personal", ctx_lambda=lam)
+    by = collections.defaultdict(list)
+    for k, r in enumerate(rows):
+        by[r["baby"]].append(k)
+    res, rng = [], np.random.default_rng(7)
+    for r_ in range(a.perms + 1):
+        yp = y_true.copy()
+        if r_:
+            for bb, ks in by.items():
+                yp[ks] = rng.permutation(yp[ks])
+        for name, kw in cfgs.items():
+            D = replay(rows, X, basis, ctxs, 10, 1.0, 0.0, 0, yp, half_life=a.half_life, w_sound=0.0, **kw)
+            for combo in ("맥락만", "맥락+이력(기기 기본)"):
+                bal, auc, _ = score(D, COMBOS[combo])
+                res.append({"cfg": name, "combo": combo, "kind": "perm" if r_ else "real", "r": r_, "bal": bal,
+                            "auc": auc})
+        print(f"  {r_}/{a.perms}", flush=True)
+    R = pd.DataFrame(res)
+    os.makedirs(OUT, exist_ok=True)
+    R.to_csv(os.path.join(OUT, "ctx_personal.csv"), index=False)
+    L = ["# 아기별 맥락 vs 공통 맥락 (실제 Enes 아기 24명, 이전 답 10개 이상, 매번 답, 소리 없음)", "",
+         "| 맥락 모델 | 조합 | 균형 정확도 | 귀무 95% | 배고픔 AUC | 귀무 95% |", "|---|---|---:|---:|---:|---:|"]
+    for (c, combo), g in R.groupby(["cfg", "combo"], sort=False):
+        re_, pm = g[g.kind == "real"].iloc[0], g[g.kind == "perm"]
+        L.append(f"| {c} | {combo} | {re_.bal:.3f} | {pm.bal.quantile(.95):.3f} | {re_.auc:.3f} | "
+                 f"{pm.auc.quantile(.95):.3f} |")
+    txt = "\n".join(L) + "\n"
+    open(os.path.join(OUT, "CTX_PERSONAL.md"), "w", encoding="utf-8").write(txt)
+    print(txt)
+
+
 def main():
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -380,10 +421,13 @@ def main():
     p.add_argument("--seeds", type=int, default=5)
     p.add_argument("--perms", type=int, default=20)
     p.add_argument("--half-life", dest="half_life", type=float, default=8)
+    p = sp.add_parser("ctxp")
+    p.add_argument("--perms", type=int, default=20)
+    p.add_argument("--half-life", type=float, default=8)
     p = sp.add_parser("tune")
     p.add_argument("--perms", type=int, default=20)
     a = ap.parse_args()
-    {"embed": cmd_embed, "basis": cmd_basis, "ctx": cmd_ctx, "run": cmd_run, "tune": cmd_tune}[a.cmd](a)
+    {"embed": cmd_embed, "basis": cmd_basis, "ctx": cmd_ctx, "run": cmd_run, "tune": cmd_tune, "ctxp": cmd_ctxp}[a.cmd](a)
 
 
 if __name__ == "__main__":

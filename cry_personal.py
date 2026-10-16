@@ -12,6 +12,8 @@
   acoustic  YAMNet 임베딩 → 음향 특징 134개(음높이·크기·eGeMAPS·MFCC) 선형 변환(acoustic_path의 coef)
   mfcc      울음 소리에서 직접 계산한 MFCC 20개의 평균·표준편차(40개). librosa.feature.mfcc와 같은 계산을 numpy로 한다
   yamnet16  예전 YAMNet 16차원(basis)
+  rhythm    프레임 세기로 계산한 울음 리듬 8개(덩어리·쉼 길이와 변동, 세기 기울기 등). 리듬으로 만든 가상 세계에서
+            +0.06~0.09, 다른 세계에서는 -0.03~0 (12차). 원인이 어디에 드러날지 모르니 기본에 넣는다
   블록마다 '아기 안 퍼짐'으로 나눠 같은 비중으로 붙인다(acoustic_path의 spread_*). YAMNet은 '무슨 소리인가'를 가르도록
   학습돼 같은 울음끼리의 음높이·세기·음색 차이에 둔하다. 정답 규칙을 여러 특징으로 만든 가상 세계에서 YAMNet 16차원이
   가장 약했다(9차).
@@ -85,6 +87,31 @@ def mfcc_stats(mf, db):
     return np.r_[mf.mean(0), mf.std(0)]
 
 
+def rhythm_stats(db, hop_s=HOP_MFCC / 16000):
+    """울음 리듬 8개(프레임 세기에서): 소리 나는 비율, 초당 울음 덩어리 수, 덩어리·쉼 평균 길이(초), 덩어리·쉼 길이
+    변동(표준편차/평균), 세기 기울기(dB/초, 커지는지 잦아드는지), 세기 폭(dB, 상위 10% - 하위 10%)."""
+    db = np.asarray(db, float)
+    act = db > db.max() - 30
+    d = np.diff(np.r_[0, act.astype(int), 0])
+    st, en = np.where(d == 1)[0], np.where(d == -1)[0]
+    keep = (en - st) >= 3                                     # 48ms 미만 덩어리는 버린다
+    st, en = st[keep], en[keep]
+    burst = (en - st) * hop_s
+    pause = (st[1:] - en[:-1]) * hop_s if len(st) > 1 else np.zeros(0)
+    dur = max(len(db) * hop_s, 1e-6)
+    cv = lambda v: float(v.std() / (v.mean() + 1e-9)) if len(v) > 1 else 0.0  # noqa: E731
+    ia = np.where(act)[0]
+    slope = float(np.polyfit(ia * hop_s, db[ia], 1)[0]) if len(ia) >= 3 else 0.0
+    rng = float(np.subtract(*np.percentile(db[ia], [90, 10]))) if len(ia) >= 3 else 0.0
+    return np.array([act.mean(), len(burst) / dur, burst.mean() if len(burst) else 0.0,
+                     pause.mean() if len(pause) else 0.0, cv(burst), cv(pause), slope, rng])
+
+
+def audio_stats(mf, db):
+    """울음마다 저장하는 소리 통계 48개 = MFCC 40 + 리듬 8."""
+    return np.r_[mfcc_stats(mf, db), rhythm_stats(db)]
+
+
 def _pack(v, dtype=np.float16):
     return base64.b64encode(np.asarray(v, dtype).tobytes()).decode()
 
@@ -97,9 +124,11 @@ class CryPersonal:
     def __init__(self, basis_path, ctx_path=None, state_path=None, k_min=10, temp=3.0, show_min=0.5,
                  hint_seconds=10, half_life=8, w_sound=1.0, proto_from="all", sound_method="proto", k_nn=3, show2_min=0.0,
                  acoustic_path=None, blocks=None, actions=None, gate=True, gate_n=8, gate_window=20, gate_margin=2,
-                 track_from=5, use_not=True, semi=False, w_semi=0.5, lda_max_dim=12):
+                 track_from=5, use_not=True, semi=False, w_semi=0.5, lda_max_dim=12, ctx_mode="global", ctx_lambda=3.0,
+                 ctx_min=5):
         """basis_path / acoustic_path: npz 경로 또는 딕셔너리. ctx_path: json 경로 또는 딕셔너리.
-        blocks: 소리 비교 공간 묶음("acoustic", "mfcc", "yamnet16"). 없으면 쓸 수 있는 것 중 acoustic + mfcc.
+        blocks: 소리 비교 공간 묶음("acoustic", "mfcc", "rhythm", "yamnet16"). 없으면 쓸 수 있는 것 중
+          acoustic + mfcc + rhythm.
         actions: 학습하는 답 목록(ACTIONS3 / ACTIONS6 또는 직접)."""
         self.actions = list(actions or ACTIONS)
         b = basis_path if isinstance(basis_path, dict) else np.load(basis_path)
@@ -112,10 +141,13 @@ class CryPersonal:
         self.mel_fb = np.asarray(a["mel_fb"], float) if "mel_fb" in a else None
         self.mfcc_norm = (np.asarray(a["mfcc_mean"], float), np.asarray(a["mfcc_std"], float)) if "mfcc_mean" in a else None
         self.dct = dct_matrix(N_MFCC, self.mel_fb.shape[0]) if self.mel_fb is not None else None
-        ok = {"yamnet16": True, "acoustic": self.ac is not None, "mfcc": self.mfcc_norm is not None}
-        want = blocks or [k for k in ("acoustic", "mfcc") if ok[k]] or ["yamnet16"]
+        self.rhythm_norm = (np.asarray(a["rhythm_mean"], float), np.asarray(a["rhythm_std"], float)) \
+            if "rhythm_mean" in a else None
+        ok = {"yamnet16": True, "acoustic": self.ac is not None, "mfcc": self.mfcc_norm is not None,
+              "rhythm": self.rhythm_norm is not None}
+        want = blocks or [k for k in ("acoustic", "mfcc", "rhythm") if ok[k]] or ["yamnet16"]
         self.blocks = [k for k in want if ok[k]] or ["yamnet16"]
-        self.w = {k: 1.0 / float(a.get(f"spread_{k}", 1.0)) for k in ("yamnet16", "acoustic", "mfcc")}
+        self.w = {k: 1.0 / float(a.get(f"spread_{k}", 1.0)) for k in ("yamnet16", "acoustic", "mfcc", "rhythm")}
         self.space = "+".join(self.blocks)
         self.ctx = None
         c = ctx_path if isinstance(ctx_path, dict) else (
@@ -139,6 +171,10 @@ class CryPersonal:
         # use_not: '해 봤는데 안 그쳤어요'(feedback_not)를 부분 정보로 쓴다. semi: 답 없는 울음에 현재 모델의
         #   추정을 w_semi 무게로 붙여 같이 배운다
         self.use_not, self.semi, self.w_semi = use_not, semi, w_semi
+        # ctx_mode: global(모든 아기 공통 맥락 모델) / personal(이 아기의 답으로 다시 배운 맥락 모델, 답 ctx_min개부터).
+        #   personal은 공통 모델 계수 쪽으로 ctx_lambda만큼 당겨(L2) 답이 적을 때 크게 흔들리지 않게 한다
+        self.ctx_mode, self.ctx_lambda, self.ctx_min = ctx_mode, ctx_lambda, ctx_min
+        self._ctx_cache = (None, None)
         # gate: 최근 gate_window개 답에서 소리 포함 예측이 gate_margin개 이상 더 맞아야 켠다(비교 gate_n개 이상).
         #   track_from: 답이 이만큼 쌓이면 소리 예측을 기록하기 시작한다(힌트에는 k_min부터)
         self.gate, self.gate_n, self.gate_window, self.gate_margin = gate, gate_n, gate_window, gate_margin
@@ -168,7 +204,7 @@ class CryPersonal:
         if not self.cur or not self.cur["mf"]:
             return None
         k = slice(None) if n_windows is None else slice(0, n_windows)
-        return mfcc_stats(np.concatenate(self.cur["mf"][k]), np.concatenate(self.cur["db"][k]))
+        return audio_stats(np.concatenate(self.cur["mf"][k]), np.concatenate(self.cur["db"][k]))
 
     def end(self, t, mfcc=None):
         """울음이 끝났을 때 호출. 저장한 울음 번호를 돌려준다(부모 답을 받을 때 쓴다).
@@ -186,6 +222,7 @@ class CryPersonal:
               "pred_sound": None, "pred_base": None}
         labeled = self._labeled()
         last_cry = self.episodes[-1]["t1"] if self.episodes else None
+        ep["c"] = ctx_features(self.cur["t0"], last_cry, self.last_feed).round(4).tolist()   # 아기별 맥락 학습용
         base = self._context(self.cur["t0"], last_cry) * self._prior(labeled)
         ep["pred_base"] = self.actions[int(np.argmax(base))]
         if len(labeled) >= self.track_from:
@@ -272,7 +309,10 @@ class CryPersonal:
                 v = ((emb - xm) / xs) @ W.T + b
             elif k == "mfcc":
                 mm, ms = self.mfcc_norm
-                v = np.zeros(len(mm)) if m is None else (np.asarray(m, float) - mm) / ms
+                v = np.zeros(len(mm)) if m is None else (np.asarray(m, float)[: len(mm)] - mm) / ms
+            elif k == "rhythm":                                   # 소리 통계 48개 중 뒤 8개(예전 기록은 0)
+                rm, rs = self.rhythm_norm
+                v = np.zeros(len(rm)) if m is None or len(m) < 48 else (np.asarray(m, float)[40:48] - rm) / rs
             else:
                 v = ((emb - self.mu) / self.sd) @ self.P
             out.append(v * self.w[k])
@@ -380,12 +420,35 @@ class CryPersonal:
         if self.ctx is None:
             return np.ones(K) / K
         W, b, m, s, classes = self.ctx
+        if self.ctx_mode == "personal":
+            W, b = self._ctx_personal(W, b, m, s, classes)
         x = (ctx_features(t, last_cry, self.last_feed) - m) / s
         z = W @ x + b
         pc = np.exp(z - z.max())
         pc = pc / pc.sum()
         p = np.array([pc[classes.index(a)] if a in classes else pc.mean() for a in self.actions])
         return p / p.sum()
+
+    def _ctx_personal(self, W0, b0, m, s, classes):
+        """이 아기의 답(울음 시작 때 맥락 특징 → 행동)으로 다항 로지스틱 회귀를 다시 맞춘다.
+        목적 = 음의 로그우도 + ctx_lambda·‖(W, b) − 공통 모델‖². 답이 ctx_min개 미만이면 공통 모델을 그대로 쓴다."""
+        ev = [e for e in self.episodes if e["action"] in classes and e.get("c") is not None]
+        if len(ev) < self.ctx_min:
+            return W0, b0
+        if self._ctx_cache[0] == len(ev):
+            return self._ctx_cache[1]
+        X = (np.array([e["c"] for e in ev]) - m) / s
+        Y = np.eye(len(classes))[[classes.index(e["action"]) for e in ev]]
+        W, b = W0.copy(), b0.copy()
+        for _ in range(200):                                    # 경사 하강(파라미터 15개라 충분)
+            z = X @ W.T + b
+            P = np.exp(z - z.max(1, keepdims=True))
+            P /= P.sum(1, keepdims=True)
+            G = P - Y
+            W -= 0.5 * (G.T @ X + 2 * self.ctx_lambda * (W - W0)) / len(ev)
+            b -= 0.5 * (G.sum(0) + 2 * self.ctx_lambda * (b - b0)) / len(ev)
+        self._ctx_cache = (len(ev), (W, b))
+        return W, b
 
     # --- 저장 --------------------------------------------------------------------
     def save(self):

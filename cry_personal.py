@@ -97,7 +97,7 @@ class CryPersonal:
     def __init__(self, basis_path, ctx_path=None, state_path=None, k_min=10, temp=3.0, show_min=0.5,
                  hint_seconds=10, half_life=8, w_sound=1.0, proto_from="all", sound_method="proto", k_nn=3, show2_min=0.0,
                  acoustic_path=None, blocks=None, actions=None, gate=True, gate_n=8, gate_window=20, gate_margin=2,
-                 track_from=5):
+                 track_from=5, use_not=True, semi=False, w_semi=0.5, lda_max_dim=12):
         """basis_path / acoustic_path: npz 경로 또는 딕셔너리. ctx_path: json 경로 또는 딕셔너리.
         blocks: 소리 비교 공간 묶음("acoustic", "mfcc", "yamnet16"). 없으면 쓸 수 있는 것 중 acoustic + mfcc.
         actions: 학습하는 답 목록(ACTIONS3 / ACTIONS6 또는 직접)."""
@@ -134,7 +134,11 @@ class CryPersonal:
         self.half_life, self.w_sound, self.proto_from = half_life, w_sound, proto_from
         # sound_method: proto(행동별 평균과 코사인) / knn(가장 비슷한 이전 울음 k개의 가중 투표).
         #   유형 크기를 맞춘 가상 세계에서 proto가 knn보다 일관되게 나았다(sim_space.py)
-        self.sound_method, self.k_nn = sound_method, k_nn
+        #   lda: 이 아기의 답으로 행동을 가르는 방향을 배우는 판별 분석(답이 적을수록 proto에 가깝게 축소)
+        self.sound_method, self.k_nn, self.lda_max_dim = sound_method, k_nn, lda_max_dim
+        # use_not: '해 봤는데 안 그쳤어요'(feedback_not)를 부분 정보로 쓴다. semi: 답 없는 울음에 현재 모델의
+        #   추정을 w_semi 무게로 붙여 같이 배운다
+        self.use_not, self.semi, self.w_semi = use_not, semi, w_semi
         # gate: 최근 gate_window개 답에서 소리 포함 예측이 gate_margin개 이상 더 맞아야 켠다(비교 gate_n개 이상).
         #   track_from: 답이 이만큼 쌓이면 소리 예측을 기록하기 시작한다(힌트에는 k_min부터)
         self.gate, self.gate_n, self.gate_window, self.gate_margin = gate, gate_n, gate_window, gate_margin
@@ -185,7 +189,7 @@ class CryPersonal:
         base = self._context(self.cur["t0"], last_cry) * self._prior(labeled)
         ep["pred_base"] = self.actions[int(np.argmax(base))]
         if len(labeled) >= self.track_from:
-            snd = self._sound(np.array(ep["zh"]), labeled) ** max(self.w_sound, 1.0)
+            snd = self._sound_model()(ep["zh"])[0] ** max(self.w_sound, 1.0)
             ep["pred_sound"] = self.actions[int(np.argmax(base * snd))]
         self.episodes.append(ep)
         self.cur = None
@@ -198,6 +202,14 @@ class CryPersonal:
         ep["action"] = action
         if action == "feed":
             self.last_feed = max(self.last_feed or 0, ep["t1"])
+        self.save()
+
+    def feedback_not(self, ep_id, action):
+        """'해 봤는데 안 그쳤어요' 기록(그 행동은 아니었다). 최종 답이 없는 울음에서 부분 정보로 쓴다."""
+        ep = self.episodes[ep_id]
+        ep.setdefault("not", [])
+        if action not in ep["not"]:
+            ep["not"].append(action)
         self.save()
 
     def log_feed(self, t):
@@ -221,7 +233,7 @@ class CryPersonal:
         check = self.check()
         sound_on = False
         if len(labeled) >= self.k_min and len(embs):
-            p_sound = self._sound(self._project(np.mean(embs, 0), mfcc), labeled)
+            p_sound = self._sound_model()(self._project(np.mean(embs, 0), mfcc))[0]
             parts["sound"] = p_sound
             sound_on = bool(self.w_sound) and (not self.gate or check["sound_better"])
             if sound_on:
@@ -277,22 +289,78 @@ class CryPersonal:
         cnt = np.bincount([self.actions.index(e["action"]) for e in labeled], weights=w, minlength=K).astype(float)
         return (cnt + 1) / (cnt.sum() + K)
 
-    def _sound(self, z, labeled):
-        return self._knn(z, labeled) if self.sound_method == "knn" else self._proto(z, labeled)
+    def _sound(self, z, labeled=None):
+        return self._sound_model()(z)[0]
 
-    def _proto(self, z, labeled):
+    def _soft_labels(self):
+        """울음마다 행동 무게 [울음, 행동]. 최종 답 = 1, '아니었어요'만 있으면 남은 행동에 나눠 합 1, 그 밖은 0."""
+        W = np.zeros((len(self.episodes), len(self.actions)))
+        for i, e in enumerate(self.episodes):
+            if e["action"] in self.actions:
+                W[i, self.actions.index(e["action"])] = 1.0
+            elif self.use_not and e.get("not"):
+                ok = [k for k, a in enumerate(self.actions) if a not in e["not"]]
+                if ok:
+                    W[i, ok] = 1.0 / len(ok)
+        return W
+
+    def _sound_model(self):
+        """지금까지의 기록으로 소리 모델을 만든다. 반환: 울음 특징들 → [n, 행동] 확률 함수.
+        답이 없는 울음도 '이 아기 평균'(기준점)과 판별 분석의 주성분에는 쓴다."""
         key = "zh" if self.proto_from == "first" else "z"
-        Z = np.array([e.get(key, e["z"]) for e in self.episodes])   # 답이 없는 울음도 '이 아기 평균'에는 쓴다
+        if self.sound_method == "knn":
+            labeled = self._labeled()
+            return lambda q: np.array([self._knn(z, labeled) for z in np.atleast_2d(np.asarray(q, float))])
+        Z = np.array([e.get(key, e["z"]) for e in self.episodes], float)
         mu = Z.mean(0)
-        zc = z - mu
-        s = np.full(len(self.actions), -1.0)
-        for k, a in enumerate(self.actions):
-            sel = [e for e in labeled if e["action"] == a]
-            if sel:
-                pc = np.mean([np.array(e.get(key, e["z"])) - mu for e in sel], axis=0)
-                s[k] = float(zc @ pc / (np.linalg.norm(zc) * np.linalg.norm(pc) + 1e-9))
-        e = np.exp(self.temp * (s - s.max()))
-        return e / e.sum()
+        X = Z - mu
+        W = self._soft_labels()
+        fit = self._fit_lda if self.sound_method == "lda" else self._fit_proto
+        if self.semi:
+            un = W.sum(1) == 0
+            if un.any() and W.sum() > 0:
+                W[un] = fit(X, W)(X[un]) * self.w_semi
+        f = fit(X, W)
+        return lambda q: f(np.atleast_2d(np.asarray(q, float)) - mu)
+
+    def _fit_proto(self, X, W):
+        """행동별 (무게) 평균과 코사인 유사도 → softmax(temp)."""
+        m = W.sum(0)
+        C = (W.T @ X) / np.maximum(m, 1e-9)[:, None]
+        Cn = C / (np.linalg.norm(C, axis=1, keepdims=True) + 1e-9)
+        has = m > 0
+
+        def pred(Q):
+            Qn = Q / (np.linalg.norm(Q, axis=1, keepdims=True) + 1e-9)
+            s = np.where(has[None], Qn @ Cn.T, -1.0)
+            e = np.exp(self.temp * (s - s.max(1, keepdims=True)))
+            return e / e.sum(1, keepdims=True)
+        return pred
+
+    def _fit_lda(self, X, W):
+        """아기별 판별 분석. 이 아기 울음의 주성분 r개 위에서 행동별 평균과 행동 안 퍼짐(Sw)을 재고, 퍼짐을 답 수에
+        따라 축소한 뒤(답이 적을수록 단위 행렬 쪽 = 거리 비교) 행동을 가르는 방향에 무게를 둔다."""
+        m, n_eff = W.sum(0), W.sum()
+        r = max(1, min(int(n_eff // 3), self.lda_max_dim, X.shape[0] - 1, X.shape[1]))
+        r = max(r, min(2, X.shape[0] - 1, X.shape[1]))
+        _, _, Vt = np.linalg.svd(X, full_matrices=False)
+        V = Vt[:r].T
+        Xr = X @ V
+        M = (W.T @ Xr) / np.maximum(m, 1e-9)[:, None]
+        R = Xr[:, None, :] - M[None]
+        Sw = np.einsum("nk,nki,nkj->ij", W, R, R) / max(n_eff, 1e-9)
+        a = r / (r + n_eff)
+        S = (1 - a) * Sw + a * (np.trace(Sw) / r + 1e-9) * np.eye(r)
+        Si = np.linalg.inv(S)
+        b = -0.5 * np.einsum("ki,ij,kj->k", M, Si, M)
+        has = m > 0
+
+        def pred(Q):
+            s = (Q @ V) @ Si @ M.T + b
+            s = np.where(has[None], s, -np.inf)
+            e = np.exp(np.maximum(s - s.max(1, keepdims=True), -30)) * has[None]
+            return e / e.sum(1, keepdims=True)
+        return pred
 
     def _knn(self, z, labeled):
         key = "zh" if self.proto_from == "first" else "z"

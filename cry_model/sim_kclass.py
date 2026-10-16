@@ -394,6 +394,146 @@ def cmd_long(a):
     print(txt)
 
 
+# --- 5. 더 해 볼 것: 아기별 판별 분석 · '아니었어요' · 답 없는 울음 --------------------------------------
+MORE_CFG = {"이력만": dict(w_sound=0.0),
+            "proto": dict(sound_method="proto", gate=False),
+            "lda": dict(sound_method="lda", gate=False),
+            "proto + 자가 검증(지금 기본)": dict(sound_method="proto"),
+            "lda + 자가 검증": dict(sound_method="lda")}
+MORE_ANS = {"답 100%": (1.0, False, False), "답 50%": (0.5, False, False), "답 50% + 아니었어요": (0.5, True, False),
+            "답 50% + 답 없는 울음": (0.5, False, True), "답 50% + 둘 다": (0.5, True, True)}
+POS_BUCKETS = [(20, 39), (40, 59), (60, 79), (80, 999)]
+
+
+def replay_more(y, actions, vorder, En, Mn, seed, cfgs, answers):
+    """가상 부모: 울음마다 p_full 확률로 최종 답. 답을 안 한 울음에서 힌트가 보였고 1순위가 틀렸으면 '아니었어요'.
+    답 여부는 울음마다 미리 뽑아 설정 간에 같다. 반환: (설정, 답 방식, 정답, 1순위, 2순위 적중, 몇 번째 울음, 소리 켜짐)."""
+    rec = []
+    for vb, ix in vorder.items():
+        draw = np.random.default_rng([seed, len(ix), int(ix[0])]).random(len(ix))
+        for aname in answers:
+            p_full, use_not, semi = MORE_ANS[aname]
+            for cname in cfgs:
+                if aname not in ("답 100%", "답 50%") and cname in ("이력만", "proto + 자가 검증(지금 기본)"):
+                    continue
+                dev = cp.CryPersonal(_W["basis"], None, acoustic_path=_W["ac"], actions=actions, hint_seconds=10,
+                                     use_not=use_not, semi=semi, **MORE_CFG[cname])
+                for pos, i in enumerate(ix):
+                    t = 1.7e9 + pos * 3600.0
+                    h = dev.hint(t, embs=[En[i]], mfcc=Mn[i])
+                    rec.append((cname, aname, y[i], actions.index(h["top"]), actions[y[i]] in h["top2"], pos, h["sound_on"]))
+                    dev.start(t)
+                    dev.add_window(En[i])
+                    eid = dev.end(t + 60, mfcc=(Mn[i], Mn[i]))
+                    if draw[pos] < p_full:
+                        dev.feedback(eid, actions[y[i]])
+                    elif use_not and h["n_feedback"] >= dev.k_min and h["top"] != actions[y[i]]:
+                        dev.feedback_not(eid, h["top"])
+    return rec
+
+
+def _virtual(world, seed, gsize):
+    """긴 사용 기간 시험과 같은 가상 아기(아기마다 평균을 빼고 시간 순서를 지켜 번갈아)."""
+    m, E0, MS, order = _W["m"], _W["E0"], _W["MS"], _W["order"]
+    rng = np.random.default_rng(seed)
+    babies = list(order)
+    rng.shuffle(babies)
+    groups = [babies[i:i + gsize] for i in range(0, len(babies) - len(babies) % gsize, gsize)]
+    En, Mn, Fn = E0.copy(), MS.copy(), _W["worlds"][world].copy()
+    allix = np.concatenate(list(order.values()))
+    gE, gM = E0[allix].mean(0), MS[allix].mean(0)
+    for ix in order.values():
+        En[ix] += gE - E0[ix].mean(0)
+        Mn[ix] += gM - MS[ix].mean(0)
+        Fn[ix] = (Fn[ix] - Fn[ix].mean(0)) / (Fn[ix].std(0) + 1e-9)
+    vorder = {}
+    for gi, grp in enumerate(groups):
+        pos = np.concatenate([np.arange(len(order[b])) / len(order[b]) for b in grp])
+        ix = np.concatenate([order[b] for b in grp])
+        vorder[f"v{gi}"] = ix[np.argsort(pos + rng.random(len(pos)) * 1e-6)]
+    return vorder, En, Mn, Fn
+
+
+def _more_task(job):
+    kind, world, seed = job
+    m = _W["m"]
+    if kind == "sim":
+        vorder, En, Mn, Fn = _virtual(world, seed, 4)
+        y = baby_rule(m, Fn, vorder, 3, None, seed)
+        rec = replay_more(y, cp.ACTIONS3, vorder, En, Mn, seed, list(MORE_CFG), list(MORE_ANS))
+    else:                                                     # 실제 Enes(답 100%), seed > 0이면 귀무
+        order = enes_order(m, min_n=2)
+        y = np.array(["FIS".index(s) if s in ("F", "I", "S") else 0 for s in m.stop.astype(str)])
+        if seed:
+            rng = np.random.default_rng(seed)
+            for ix in order.values():
+                y[ix] = rng.permutation(y[ix])
+        rec = replay_more(y, cp.ACTIONS3, order, _W["E0"], _W["MS"], seed, list(MORE_CFG), ["답 100%"])
+    return [(kind, world, seed) + r for r in rec]
+
+
+def cmd_more(a):
+    import warnings
+    from multiprocessing import Pool
+    warnings.filterwarnings("ignore")
+    jobs = [("sim", w, s) for w in ("요약 6", "eGeMAPS", "MFCC", "YAMNet", "스펙트럼 모양", "리듬") for s in range(a.seeds)]
+    jobs += [("real", "실제 Enes", s) for s in range(a.perms + 1)]
+    rows, t0 = [], time.time()
+    with Pool(a.workers, initializer=_init_run) as pool:
+        for n, r in enumerate(pool.imap_unordered(_more_task, jobs)):
+            rows += r
+            if (n + 1) % 12 == 0:
+                print(f"  {n + 1}/{len(jobs)} {time.time() - t0:.0f}s", flush=True)
+    D = pd.DataFrame(rows, columns=["kind", "world", "seed", "cfg", "ans", "y", "pred", "hit2", "pos", "on"])
+    D.to_csv(os.path.join(sa.RUNS, "kclass_more.csv"), index=False)
+    report_more(D)
+
+
+def _score(x):
+    """(world, seed)마다 1순위 균형 정확도와 2순위 안 적중률(행동별 평균)을 내서 평균."""
+    t1, t2 = [], []
+    for _, g in x.groupby(["world", "seed"]):
+        t1.append(sa.bal_np(g.y, g.pred))
+        t2.append(np.mean([g.hit2[g.y == k].mean() for k in g.y.unique()]))
+    return np.mean(t1), np.mean(t2)
+
+
+def report_more(D):
+    fair = ["YAMNet", "스펙트럼 모양", "리듬"]                     # 음향 변환 + MFCC와 무관한 특징으로 만든 세계
+    S = D[(D.kind == "sim") & D.world.isin(fair)]
+    lab = lambda lo, hi: f"{lo}~{hi}" if hi < 999 else f"{lo}+"  # noqa: E731
+    L = ["# 아기별 판별 분석 · '아니었어요' · 답 없는 울음 (행동 3개, 가상 아기 울음 약 100개)", "",
+         "- 가상 아기 = Enes 아기 4명을 평균 빼고 이어 붙임(5명 × 시드). 공정한 세계(YAMNet·스펙트럼 모양·리듬) 평균.",
+         "- 칸 = 1순위 균형 정확도 / 2순위 안 적중률(무작위 0.33 / 0.67). 구간 = 몇 번째 울음인지(답 비율이 달라도 같은 기간).",
+         "- '아니었어요' = 최종 답을 안 한 울음에서 힌트 1순위를 해 봤는데 안 그친 경우만 누름.", "",
+         "| 답 방식 | 방법 | " + " | ".join(f"울음 {lab(lo, hi)}번째" for lo, hi in POS_BUCKETS) + " | 소리 켜짐 |",
+         "|---|---|" + "---:|" * (len(POS_BUCKETS) + 1)]
+    for aname in MORE_ANS:
+        for cname in MORE_CFG:
+            g = S[(S.ans == aname) & (S.cfg == cname)]
+            if g.empty:
+                continue
+            cells = []
+            for lo, hi in POS_BUCKETS:
+                t1, t2 = _score(g[(g.pos >= lo) & (g.pos <= hi)])
+                cells.append(f"{t1:.2f} / {t2:.2f}")
+            on = f"{g[g.pos >= 20].on.mean():.0%}" if "자가" in cname else "-"
+            L.append(f"| {aname} | {cname} | " + " | ".join(cells) + f" | {on} |")
+    R = D[D.kind == "real"]
+    L += ["", "## 실제 Enes (답 100%, 아기 24명, 답 10개 이상 = 11번째 울음부터)", "",
+          "| 방법 | 실제 | 귀무 95% (아기 안 라벨 섞기 20번) | 소리 켜짐 |", "|---|---:|---:|---:|"]
+    for cname in MORE_CFG:
+        x = R[(R.cfg == cname) & (R.pos >= 10)]
+        r1, r2 = _score(x[x.seed == 0])
+        nul = [_score(g) for _, g in x[x.seed > 0].groupby("seed")]
+        n1, n2 = np.quantile([v[0] for v in nul], .95), np.quantile([v[1] for v in nul], .95)
+        L.append(f"| {cname} | {r1:.3f} / {r2:.3f} | {n1:.3f} / {n2:.3f} | "
+                 + (f"{x[x.seed == 0].on.mean():.0%}" if "자가" in cname else "-") + " |")
+    txt = "\n".join(L) + "\n"
+    open(os.path.join(sa.RUNS, "KCLASS_MORE_REPORT.md"), "w", encoding="utf-8").write(txt)
+    print(txt)
+
+
 def main():
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -408,8 +548,12 @@ def main():
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--seeds", type=int, default=5)
     p.add_argument("--group", type=int, default=4, help="가상 아기 하나에 묶을 Enes 아기 수")
+    p = sp.add_parser("more")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--seeds", type=int, default=6)
+    p.add_argument("--perms", type=int, default=20)
     a = ap.parse_args()
-    {"feats": cmd_feats, "export": cmd_export, "run": cmd_run, "long": cmd_long}[a.cmd](a)
+    {"feats": cmd_feats, "export": cmd_export, "run": cmd_run, "long": cmd_long, "more": cmd_more}[a.cmd](a)
 
 
 if __name__ == "__main__":

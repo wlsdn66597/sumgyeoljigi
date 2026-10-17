@@ -549,10 +549,10 @@ RHY_CFG = {"이력만": dict(w_sound=0.0),
 
 
 def _rhy_task(job):
-    kind, world, seed = job
+    kind, world, seed, gsize = job
     m = _W["m"]
     if kind == "sim":
-        vorder, En, Mn, Fn = _virtual(world, seed, 4)
+        vorder, En, Mn, Fn = _virtual(world, seed, gsize)
         y = baby_rule(m, Fn, vorder, 3, None, seed)
         rec = replay_more(y, cp.ACTIONS3, vorder, En, Mn, seed, list(RHY_CFG), ["답 100%"], RHY_CFG)
     else:
@@ -570,8 +570,11 @@ def cmd_rhythm(a):
     import warnings
     from multiprocessing import Pool
     warnings.filterwarnings("ignore")
-    jobs = [("sim", w, s) for w in ("요약 6", "eGeMAPS", "MFCC", "YAMNet", "스펙트럼 모양", "리듬") for s in range(a.seeds)]
-    jobs += [("real", "실제 Enes", s) for s in range(a.perms + 1)]
+    jobs = [("sim", w, s, a.group) for w in ("요약 6", "eGeMAPS", "MFCC", "YAMNet", "스펙트럼 모양", "리듬")
+            for s in range(a.seeds)]
+    jobs += [("real", "실제 Enes", s, a.group) for s in range(a.perms + 1)]
+    buckets = POS_BUCKETS if a.group <= 4 else [(20, 39), (40, 79), (80, 119), (120, 159), (160, 199), (200, 999)]
+    tag = "" if a.group == 4 else f"_g{a.group}"
     rows, t0 = [], time.time()
     with Pool(a.workers, initializer=_init_run) as pool:
         for n, r in enumerate(pool.imap_unordered(_rhy_task, jobs)):
@@ -579,9 +582,9 @@ def cmd_rhythm(a):
             if (n + 1) % 12 == 0:
                 print(f"  {n + 1}/{len(jobs)} {time.time() - t0:.0f}s", flush=True)
     D = pd.DataFrame(rows, columns=["kind", "world", "seed", "cfg", "ans", "y", "pred", "hit2", "pos", "on"])
-    D.to_csv(os.path.join(sa.RUNS, "kclass_rhythm.csv"), index=False)
+    D.to_csv(os.path.join(sa.RUNS, f"kclass_rhythm{tag}.csv"), index=False)
     lab = lambda lo, hi: f"{lo}~{hi}" if hi < 999 else f"{lo}+"  # noqa: E731
-    L = ["# 리듬·시간 특징 블록 (행동 3개, 가상 아기 울음 약 100개, 답 100%)", "",
+    L = [f"# 리듬·시간 특징 블록 (행동 3개, 아기 {a.group}명을 이어 붙인 가상 아기 울음 약 {25 * a.group}개, 답 100%)", "",
          "- 리듬 8개 = 프레임 세기에서 소리 나는 비율, 초당 덩어리 수, 덩어리·쉼 길이와 변동, 세기 기울기, 세기 폭.",
          "- 공정 = YAMNet·스펙트럼 모양 세계(어떤 블록과도 무관). 리듬 세계 = Enes 메타(음절 속도·쉼·유성·울음 길이)로 만든",
          "  정답이라 리듬 블록과 개념이 겹친다('배울 수 있는가' 확인용). 칸 = 1순위 / 2순위 안(무작위 0.33 / 0.67).", ""]
@@ -590,11 +593,11 @@ def cmd_rhythm(a):
     for title, ws in groups:
         S = D[(D.kind == "sim") & D.world.isin(ws)]
         L += [f"## {title}", "",
-              "| 방법 | " + " | ".join(f"울음 {lab(lo, hi)}번째" for lo, hi in POS_BUCKETS) + " | 소리 켜짐 |",
-              "|---|" + "---:|" * (len(POS_BUCKETS) + 1)]
+              "| 방법 | " + " | ".join(f"울음 {lab(lo, hi)}번째" for lo, hi in buckets) + " | 소리 켜짐 |",
+              "|---|" + "---:|" * (len(buckets) + 1)]
         for c in RHY_CFG:
             g = S[S.cfg == c]
-            cells = ["%.2f / %.2f" % _score(g[(g.pos >= lo) & (g.pos <= hi)]) for lo, hi in POS_BUCKETS]
+            cells = ["%.2f / %.2f" % _score(g[(g.pos >= lo) & (g.pos <= hi)]) for lo, hi in buckets]
             on = f"{g[g.pos >= 20].on.mean():.0%}" if "자가" in c else "-"
             L.append(f"| {c} | " + " | ".join(cells) + f" | {on} |")
         L.append("")
@@ -605,10 +608,11 @@ def cmd_rhythm(a):
         r1, r2 = _score(x[x.seed == 0])
         nul = [_score(g) for _, g in x[x.seed > 0].groupby("seed")]
         on = f"{x[x.seed == 0].on.mean():.0%}" if "자가" in c else "-"
-        L.append(f"| {c} | {r1:.3f} / {r2:.3f} | {np.quantile([v[0] for v in nul], .95):.3f} / "
-                 f"{np.quantile([v[1] for v in nul], .95):.3f} | {on} |")
+        nn = (f"{np.quantile([v[0] for v in nul], .95):.3f} / {np.quantile([v[1] for v in nul], .95):.3f}"
+              if nul else "-")
+        L.append(f"| {c} | {r1:.3f} / {r2:.3f} | {nn} | {on} |")
     txt = "\n".join(L) + "\n"
-    open(os.path.join(sa.RUNS, "KCLASS_RHYTHM_REPORT.md"), "w", encoding="utf-8").write(txt)
+    open(os.path.join(sa.RUNS, f"KCLASS_RHYTHM_REPORT{tag}.md"), "w", encoding="utf-8").write(txt)
     print(txt)
 
 
@@ -633,6 +637,7 @@ def main():
     p = sp.add_parser("rhythm")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--seeds", type=int, default=6)
+    p.add_argument("--group", type=int, default=4, help="가상 아기 하나에 묶을 Enes 아기 수(11이면 울음 약 275개)")
     p.add_argument("--perms", type=int, default=20)
     a = ap.parse_args()
     {"feats": cmd_feats, "export": cmd_export, "run": cmd_run, "long": cmd_long, "more": cmd_more,

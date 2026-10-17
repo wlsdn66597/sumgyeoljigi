@@ -39,7 +39,31 @@ CFG = {"이력만": dict(w_sound=0.0, blocks=["acoustic"]),
        "음향 변환 + MFCC": dict(blocks=["acoustic", "mfcc"], gate=False),
        "YAMNet 16 + MFCC": dict(blocks=["yamnet16", "mfcc"], gate=False),
        "음향 변환 + MFCC, 자가 검증": dict(blocks=["acoustic", "mfcc"], gate=True)}
-FAMILY = {"yamnet16": {"YAMNet"}, "acoustic": {"요약 6", "eGeMAPS", "MFCC"}, "mfcc": {"MFCC"}, "rhythm": {"리듬"}}
+FAMILY = {"yamnet16": {"YAMNet"}, "acoustic": {"요약 6", "eGeMAPS", "MFCC"}, "mfcc": {"MFCC"}, "rhythm": {"리듬"},
+          "voice": {"목소리"}, "spectral": {"스펙트럼 모양"}}
+
+
+def _family_pca(worlds, enes):
+    """혼합 세계용: 특징 묶음마다 Enes 울음으로 표준화 → 주성분 5개."""
+    out = {}
+    for k, F in worlds.items():
+        X = np.nan_to_num(F[enes].astype(float))
+        mu, sd = X.mean(0), X.std(0) + 1e-9
+        Z = (X - mu) / sd
+        _, _, Vt = np.linalg.svd(Z - Z.mean(0), full_matrices=False)
+        P = np.zeros((len(F), 5))
+        P[enes] = Z @ Vt[:5].T
+        out[k] = P
+    return out
+
+
+def mixed_world(seed):
+    """혼합 세계: 모든 특징 묶음의 주성분 5개를 묶음마다 무작위 비율·무작위 방향으로 섞은 10차원.
+    원인이 여러 특징에 조금씩 섞여 드러나는 경우."""
+    rng = np.random.default_rng(1000 + seed)
+    fams = _W["fam5"]
+    w = rng.dirichlet(np.ones(len(fams)))
+    return sum(w[i] * (F @ rng.standard_normal((5, 10))) for i, F in enumerate(fams.values()))
 _W = {}
 
 
@@ -79,8 +103,8 @@ def _feat_one(job):
         sc = _W["yam"].it.get_tensor(_W["yam"].out[521]).reshape(-1)
         cry.append(max(sc[19], sc[20]) >= sa.CRY_THR)
     use = [w for w, c in zip(wins, cry) if c] or wins
-    fr = [cp.mfcc_frames(w, _W["fb"]) for w in use]
-    ms = cp.audio_stats(np.concatenate([f[0] for f in fr]), np.concatenate([f[1] for f in fr]))   # MFCC 40 + 리듬 8
+    fr = [cp.frame_features(w, _W["fb"]) for w in use]
+    ms = cp.audio_stats(*(np.concatenate([f[j] for f in fr]) for j in range(5)))   # MFCC 40 + 리듬 8 + 목소리 14 + 스펙트럼 20
     xs = np.pad(x, (0, max(0, sa.SR - len(x))))
     return k, ms.astype(np.float32), spectral_shape(xs).astype(np.float32)
 
@@ -101,7 +125,7 @@ def rhythm(m):
 def cmd_feats(a):
     from multiprocessing import Pool
     m = sa.items()
-    MS = np.zeros((len(m), 48), np.float32)
+    MS = np.zeros((len(m), 82), np.float32)
     SP = np.zeros((len(m), 22), np.float32)
     t0 = time.time()
     with Pool(a.workers, initializer=_init_feats) as pool:
@@ -110,7 +134,8 @@ def cmd_feats(a):
             if (n + 1) % 500 == 0:
                 print(f"  {n + 1}/{len(m)} {time.time() - t0:.0f}s", flush=True)
     m2 = pd.read_csv(os.path.join(sa.OUT, "items.csv"))
-    np.savez(FEATS2, mfcc_dev=MS[:, :40], rhythm_dev=np.nan_to_num(MS[:, 40:]), spec=np.nan_to_num(SP),
+    MS = np.nan_to_num(MS)
+    np.savez(FEATS2, mfcc_dev=MS[:, :40], rhythm_dev=MS[:, 40:48], audio_dev=MS, spec=np.nan_to_num(SP),
              rhythm=rhythm(m2))
     print(f"저장 {FEATS2} {time.time() - t0:.0f}s", flush=True)
 
@@ -132,19 +157,18 @@ def cmd_export(_):
     f = np.load(FEATS2)
     z = dict(np.load(ACOUSTIC_NPZ))
     pub = (m.source != "enes").values
-    MS = np.c_[f["mfcc_dev"], f["rhythm_dev"]].astype(float)
-    z["rhythm_mean"] = MS[pub, 40:].mean(0).astype(np.float32)
-    z["rhythm_std"] = (MS[pub, 40:].std(0) + 1e-6).astype(np.float32)
+    MS = f["audio_dev"].astype(float)
+    for k, (lo, hi) in cp.AUDIO_SLICES.items():
+        z[f"{k}_mean"] = MS[pub, lo:hi].mean(0).astype(np.float32)
+        z[f"{k}_std"] = (MS[pub, lo:hi].std(0) + 1e-6).astype(np.float32)
     z["mel_fb"] = librosa.filters.mel(sr=sa.SR, n_fft=cp.N_FFT).astype(np.float32)
-    z["mfcc_mean"] = MS[pub, :40].mean(0).astype(np.float32)
-    z["mfcc_std"] = (MS[pub, :40].std(0) + 1e-6).astype(np.float32)
-    for k in ("spread_yamnet16", "spread_acoustic", "spread_mfcc", "spread_rhythm"):
+    for k in ("spread_yamnet16", "spread_acoustic", *(f"spread_{b}" for b in cp.AUDIO_SLICES)):
         z.pop(k, None)
     b = np.load(os.path.join(sa.ART, "cry_personal_basis.npz"))
     dev = cp.CryPersonal({k: b[k] for k in ("mean", "std", "pca")}, None, acoustic_path=z,
-                         blocks=["yamnet16", "acoustic", "mfcc", "rhythm"])
+                         blocks=["yamnet16", "acoustic", *cp.AUDIO_SLICES])
     order = enes_order(m, min_n=2)
-    for blk in ("yamnet16", "acoustic", "mfcc", "rhythm"):
+    for blk in ("yamnet16", "acoustic", *cp.AUDIO_SLICES):
         dev.blocks, dev.w[blk] = [blk], 1.0
         Z = np.array([dev._project(E[i, 0], MS[i]) for i in range(len(m))])
         d = np.concatenate([Z[ix] - Z[ix].mean(0) for ix in order.values()])
@@ -183,11 +207,15 @@ def _init_run():
     m, A, E, G, O, VAR, MODES, view = sa.load_all()
     f, f2 = np.load(ss.FEATS), np.load(FEATS2)
     b = np.load(os.path.join(sa.ART, "cry_personal_basis.npz"))
-    MS = np.c_[f2["mfcc_dev"], f2["rhythm_dev"]] if "rhythm_dev" in f2 else f2["mfcc_dev"]
+    MS = f2["audio_dev"] if "audio_dev" in f2 else (np.c_[f2["mfcc_dev"], f2["rhythm_dev"]] if "rhythm_dev" in f2
+                                                      else f2["mfcc_dev"])
     _W.update(m=m, E0=E[:, 0].copy(), MS=MS.astype(float), basis={k: b[k] for k in ("mean", "std", "pca")},
               ac=dict(np.load(ACOUSTIC_NPZ)), order=enes_order(m),
               worlds={"요약 6": A[:, 0].copy(), "eGeMAPS": f["egemaps"].astype(float), "MFCC": f2["mfcc_dev"].astype(float),
                       "YAMNet": E[:, 0].copy(), "스펙트럼 모양": f2["spec"].astype(float), "리듬": f2["rhythm"]})
+    if "audio_dev" in f2:
+        _W["worlds"]["목소리"] = f2["audio_dev"][:, 48:62].astype(float)
+    _W["fam5"] = _family_pca(_W["worlds"], (m.source == "enes").values)
     del E
 
 
@@ -198,7 +226,7 @@ def replay(y, actions, order):
     for name, kw in CFG.items():
         rec = []
         for ix in order.values():
-            dev = cp.CryPersonal(_W["basis"], None, acoustic_path=_W["ac"], actions=actions, hint_seconds=10, **kw)
+            dev = cp.CryPersonal(_W["basis"], None, acoustic_path=_W["ac"], actions=actions, hint_seconds=10, **{"sound_method": "proto", **kw})
             for i in ix:
                 t = float(m.t.values[i])
                 h = dev.hint(t, embs=[E0[i]], mfcc=MS[i])
@@ -339,7 +367,7 @@ def _long_task(job):
     for name in LONG_CFG:
         kw = CFG[name]
         for ix in vorder.values():
-            dev = cp.CryPersonal(_W["basis"], None, acoustic_path=_W["ac"], actions=actions, hint_seconds=10, **kw)
+            dev = cp.CryPersonal(_W["basis"], None, acoustic_path=_W["ac"], actions=actions, hint_seconds=10, **{"sound_method": "proto", **kw})
             for n_, i in enumerate(ix):
                 t = 1.7e9 + n_ * 3600.0
                 h = dev.hint(t, embs=[En[i]], mfcc=Mn[i])
@@ -422,7 +450,7 @@ def replay_more(y, actions, vorder, En, Mn, seed, cfgs, answers, cfgdict=None):
                 if aname not in ("답 100%", "답 50%") and cname in ("이력만", "proto + 자가 검증(지금 기본)"):
                     continue
                 dev = cp.CryPersonal(_W["basis"], None, acoustic_path=_W["ac"], actions=actions, hint_seconds=10,
-                                     use_not=use_not, semi=semi, **(cfgdict or MORE_CFG)[cname])
+                                     use_not=use_not, semi=semi, **{"sound_method": "proto", **(cfgdict or MORE_CFG)[cname]})
                 for pos, i in enumerate(ix):
                     t = 1.7e9 + pos * 3600.0
                     h = dev.hint(t, embs=[En[i]], mfcc=Mn[i])
@@ -437,14 +465,14 @@ def replay_more(y, actions, vorder, En, Mn, seed, cfgs, answers, cfgdict=None):
     return rec
 
 
-def _virtual(world, seed, gsize):
+def _virtual(world, seed, gsize, F=None):
     """긴 사용 기간 시험과 같은 가상 아기(아기마다 평균을 빼고 시간 순서를 지켜 번갈아)."""
     m, E0, MS, order = _W["m"], _W["E0"], _W["MS"], _W["order"]
     rng = np.random.default_rng(seed)
     babies = list(order)
     rng.shuffle(babies)
     groups = [babies[i:i + gsize] for i in range(0, len(babies) - len(babies) % gsize, gsize)]
-    En, Mn, Fn = E0.copy(), MS.copy(), _W["worlds"][world].copy()
+    En, Mn, Fn = E0.copy(), MS.copy(), (_W["worlds"][world] if F is None else F).copy()
     allix = np.concatenate(list(order.values()))
     gE, gM = E0[allix].mean(0), MS[allix].mean(0)
     for ix in order.values():
@@ -616,6 +644,77 @@ def cmd_rhythm(a):
     print(txt)
 
 
+# --- 7. 목소리 질·스펙트럼 블록과 모든 블록 합치기 (가상 세계 점수 최대화) --------------------------------
+VOICE_CFG = {"이력만": dict(w_sound=0.0),
+             "지금 (음향+MFCC+리듬)": dict(blocks=["acoustic", "mfcc", "rhythm"], gate=False),
+             "+목소리": dict(blocks=["acoustic", "mfcc", "rhythm", "voice"], gate=False),
+             "+스펙트럼": dict(blocks=["acoustic", "mfcc", "rhythm", "spectral"], gate=False),
+             "+목소리+스펙트럼": dict(blocks=["acoustic", "mfcc", "rhythm", "voice", "spectral"], gate=False),
+             "전부(+YAMNet16)": dict(blocks=["yamnet16", "acoustic", "mfcc", "rhythm", "voice", "spectral"], gate=False),
+             "전부, 아기별 판별 분석": dict(blocks=["yamnet16", "acoustic", "mfcc", "rhythm", "voice", "spectral"],
+                                     sound_method="lda", gate=False),
+             "목소리만": dict(blocks=["voice"], gate=False)}
+VOICE_WORLDS = ("요약 6", "eGeMAPS", "MFCC", "YAMNet", "스펙트럼 모양", "리듬", "목소리", "혼합")
+
+
+def _voice_task(job):
+    world, seed = job
+    m = _W["m"]
+    F = mixed_world(seed) if world == "혼합" else None
+    vorder, En, Mn, Fn = _virtual(world, seed, 4, F)
+    y = baby_rule(m, Fn, vorder, 3, None, seed)
+    rec = replay_more(y, cp.ACTIONS3, vorder, En, Mn, seed, list(VOICE_CFG), ["답 100%"], VOICE_CFG)
+    return [("sim", world, seed) + r for r in rec]
+
+
+def cmd_voice(a):
+    import warnings
+    from multiprocessing import Pool
+    warnings.filterwarnings("ignore")
+    jobs = [(w, s) for w in VOICE_WORLDS for s in range(a.seeds)]
+    rows, t0 = [], time.time()
+    with Pool(a.workers, initializer=_init_run) as pool:
+        for n, r in enumerate(pool.imap_unordered(_voice_task, jobs)):
+            rows += r
+            if (n + 1) % 12 == 0:
+                print(f"  {n + 1}/{len(jobs)} {time.time() - t0:.0f}s", flush=True)
+    D = pd.DataFrame(rows, columns=["kind", "world", "seed", "cfg", "ans", "y", "pred", "hit2", "pos", "on"])
+    D.to_csv(os.path.join(sa.RUNS, "kclass_voice.csv"), index=False)
+    report_voice(D)
+
+
+def report_voice(D):
+    S = D[D.pos >= 20]
+    worlds = [w for w in VOICE_WORLDS if w in set(S.world)]
+    sc = {(c, w): _score(S[(S.cfg == c) & (S.world == w)]) for c in VOICE_CFG for w in worlds}
+    L = ["# 목소리 질·스펙트럼 블록과 블록 합치기 — 가상 세계 점수 (행동 3개, 가상 아기 울음 약 100개, 답 100%)", "",
+         "- 칸 = 20번째 울음부터의 1순위 균형 정확도 / 2순위 안 적중률(무작위 0.33 / 0.67). 소리는 항상 켬(자가 검증 없음).",
+         "- 정답 세계 8가지: 특징 묶음 7가지 + 혼합(모든 묶음을 무작위 비율로 섞음). **굵게** = 그 공간이 같은 특징을 쓰는 세계(순환).",
+         "- 전체 평균 = 8개 세계 평균(목표 점수). 공정 평균 = 순환 세계를 뺀 평균.", "",
+         "| 비교 공간 | " + " | ".join(worlds) + " | **전체 평균** | 공정 평균 |", "|---|" + "---:|" * (len(worlds) + 2)]
+    for c, kw in VOICE_CFG.items():
+        circ = set().union(*[FAMILY[b] for b in kw.get("blocks", [])]) if c != "이력만" else set()
+        cells = [(f"**{sc[(c, w)][0]:.2f} / {sc[(c, w)][1]:.2f}**" if w in circ else f"{sc[(c, w)][0]:.2f} / {sc[(c, w)][1]:.2f}")
+                 for w in worlds]
+        allm = np.mean([sc[(c, w)] for w in worlds], 0)
+        fair = [sc[(c, w)] for w in worlds if w not in circ]
+        fm = np.mean(fair, 0) if fair else (np.nan, np.nan)
+        L.append(f"| {c} | " + " | ".join(cells) + f" | **{allm[0]:.3f} / {allm[1]:.3f}** | {fm[0]:.3f} / {fm[1]:.3f} |")
+    lab = lambda lo, hi: f"{lo}~{hi}" if hi < 999 else f"{lo}+"  # noqa: E731
+    L += ["", "## 전체 평균을 울음 구간별로", "", "| 비교 공간 | " + " | ".join(f"울음 {lab(lo, hi)}번째" for lo, hi in POS_BUCKETS) + " |",
+          "|---|" + "---:|" * len(POS_BUCKETS)]
+    for c in VOICE_CFG:
+        cells = []
+        for lo, hi in POS_BUCKETS:
+            x = D[(D.cfg == c) & (D.pos >= lo) & (D.pos <= hi)]
+            v = np.mean([_score(x[x.world == w]) for w in worlds], 0)
+            cells.append(f"{v[0]:.2f} / {v[1]:.2f}")
+        L.append(f"| {c} | " + " | ".join(cells) + " |")
+    txt = "\n".join(L) + "\n"
+    open(os.path.join(sa.RUNS, "KCLASS_VOICE_REPORT.md"), "w", encoding="utf-8").write(txt)
+    print(txt)
+
+
 def main():
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -639,9 +738,12 @@ def main():
     p.add_argument("--seeds", type=int, default=6)
     p.add_argument("--group", type=int, default=4, help="가상 아기 하나에 묶을 Enes 아기 수(11이면 울음 약 275개)")
     p.add_argument("--perms", type=int, default=20)
+    p = sp.add_parser("voice")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--seeds", type=int, default=6)
     a = ap.parse_args()
     {"feats": cmd_feats, "export": cmd_export, "run": cmd_run, "long": cmd_long, "more": cmd_more,
-     "rhythm": cmd_rhythm}[a.cmd](a)
+     "rhythm": cmd_rhythm, "voice": cmd_voice}[a.cmd](a)
 
 
 if __name__ == "__main__":

@@ -302,7 +302,7 @@ def cmd_device(a):
             for bb in babies:
                 ix = np.where(m.baby.values == bb)[0]
                 ix = ix[np.lexsort((m.bout.values[ix], m.t.values[ix]))]
-                dev = cp.CryPersonal(basis, None, actions=cp.ACTIONS3, acoustic_path=kw.get("acoustic"), w_sound=kw.get("w_sound", 1.0),
+                dev = cp.CryPersonal(basis, None, actions=cp.ACTIONS3, sound_method="proto", acoustic_path=kw.get("acoustic"), w_sound=kw.get("w_sound", 1.0),
                                      gate=kw.get("gate", True), hint_seconds=10)
                 for i in ix:
                     t = float(m.t.values[i])

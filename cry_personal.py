@@ -66,13 +66,83 @@ def dct_matrix(n_out=N_MFCC, n_in=128):
     return D
 
 
-def mfcc_frames(x, mel_fb, D=None):
-    """한 구간(파이는 1초 창)의 MFCC [프레임, 20]과 프레임 크기(RMS dB). mel_fb = librosa.filters.mel(16000, 1024)."""
-    D = dct_matrix(N_MFCC, mel_fb.shape[0]) if D is None else D
+SR = 16000
+F0_MIN, F0_MAX, YIN_TH = 150.0, 2000.0, 0.15
+BANDS = [(0, 1000), (1000, 2000), (2000, 4000), (4000, 8001)]
+
+
+def _frames(x):
     x = np.asarray(x, float)
     xp = np.pad(x, N_FFT // 2)
     n = 1 + len(x) // HOP_MFCC
-    fr = xp[np.arange(N_FFT)[None, :] + HOP_MFCC * np.arange(n)[:, None]]
+    return xp[np.arange(N_FFT)[None, :] + HOP_MFCC * np.arange(n)[:, None]]
+
+
+def yin_frames(fr, sr=SR, fmin=F0_MIN, fmax=F0_MAX, th=YIN_TH):
+    """프레임마다 YIN 음높이(Hz, 무성음이면 nan)와 비주기성(0 = 맑은 음, 1 = 잡음). numpy만."""
+    tmax, tmin = int(sr / fmin), max(2, int(sr / fmax))
+    W = fr.shape[1] - tmax
+    a, b = fr[:, :W], fr[:, :W + tmax]
+    nf = 1 << int(np.ceil(np.log2(W + tmax + 1)))
+    r = np.fft.irfft(np.conj(np.fft.rfft(a, nf)) * np.fft.rfft(b, nf), nf)[:, : tmax + 1]
+    c = np.cumsum(np.c_[np.zeros(len(fr)), b ** 2], axis=1)
+    e0 = c[:, W][:, None]
+    et = c[:, W:W + tmax + 1] - c[:, : tmax + 1]
+    d = np.maximum(e0 + et - 2 * r, 0)
+    cm = np.cumsum(d[:, 1:], axis=1) / np.arange(1, tmax + 1)
+    dn = np.c_[np.ones(len(fr)), d[:, 1:] / (cm + 1e-12)]
+    f0, ap = np.full(len(fr), np.nan), np.ones(len(fr))
+    for i in range(len(fr)):
+        row = dn[i]
+        below = np.where(row[tmin:] < th)[0]
+        if len(below):
+            t = tmin + below[0]
+            while t + 1 <= tmax and row[t + 1] < row[t]:
+                t += 1
+        else:
+            t = tmin + int(np.argmin(row[tmin:]))
+        ap[i] = row[t]
+        if row[t] < th and 0 < t < tmax:                       # 포물선 보간
+            y0, y1, y2 = row[t - 1], row[t], row[t + 1]
+            den = y0 - 2 * y1 + y2
+            tt = t + (0.5 * (y0 - y2) / den if abs(den) > 1e-12 else 0.0)
+            f0[i] = sr / tt
+    return f0, ap
+
+
+def spectral_frame_feats(S, sr=SR):
+    """파워 스펙트럼 프레임마다 10개: 무게중심·대역폭·롤오프(85%)(로그), 평탄도(로그), 엔트로피, 변화량, 대역 에너지 비율 4개."""
+    f = np.linspace(0, sr / 2, S.shape[1])
+    P = S + 1e-12
+    tot = P.sum(1, keepdims=True)
+    p = P / tot
+    cen = (p * f).sum(1)
+    bw = np.sqrt((p * (f - cen[:, None]) ** 2).sum(1))
+    roll = f[np.minimum((np.cumsum(p, 1) < 0.85).sum(1), len(f) - 1)]
+    flat = np.exp(np.log(P).mean(1)) / P.mean(1)
+    ent = -(p * np.log(p)).sum(1) / np.log(S.shape[1])
+    flux = np.r_[0.0, np.sqrt((np.maximum(np.diff(p, axis=0), 0) ** 2).sum(1))]
+    bands = np.stack([P[:, (f >= lo) & (f < hi)].sum(1) for lo, hi in BANDS], 1) / tot
+    return np.c_[np.log(cen + 1), np.log(bw + 1), np.log(roll + 1), np.log(flat + 1e-12), ent, flux,
+                 10 * np.log10(bands + 1e-12)]
+
+
+def frame_features(x, mel_fb, D=None):
+    """한 구간(파이는 1초 창)의 프레임 특징. 반환: MFCC [n, 20], 세기 dB [n], 음높이 Hz [n], 비주기성 [n], 스펙트럼 [n, 10]."""
+    D = dct_matrix(N_MFCC, mel_fb.shape[0]) if D is None else D
+    fr = _frames(x)
+    win = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(N_FFT) / N_FFT)
+    S = np.abs(np.fft.rfft(fr * win, axis=1)) ** 2
+    mel = 10 * np.log10(np.maximum(S @ mel_fb.T, 1e-10))
+    mel = np.maximum(mel, mel.max() - 80)
+    f0, ap = yin_frames(fr)
+    return mel @ D.T, 20 * np.log10(np.sqrt((fr ** 2).mean(1)) + 1e-9), f0, ap, spectral_frame_feats(S)
+
+
+def mfcc_frames(x, mel_fb, D=None):
+    """한 구간(파이는 1초 창)의 MFCC [프레임, 20]과 프레임 크기(RMS dB). mel_fb = librosa.filters.mel(16000, 1024)."""
+    D = dct_matrix(N_MFCC, mel_fb.shape[0]) if D is None else D
+    fr = _frames(x)
     win = 0.5 - 0.5 * np.cos(2 * np.pi * np.arange(N_FFT) / N_FFT)
     S = np.abs(np.fft.rfft(fr * win, axis=1)) ** 2
     db = 10 * np.log10(np.maximum(S @ mel_fb.T, 1e-10))
@@ -107,9 +177,71 @@ def rhythm_stats(db, hop_s=HOP_MFCC / 16000):
                      pause.mean() if len(pause) else 0.0, cv(burst), cv(pause), slope, rng])
 
 
-def audio_stats(mf, db):
-    """울음마다 저장하는 소리 통계 48개 = MFCC 40 + 리듬 8."""
-    return np.r_[mfcc_stats(mf, db), rhythm_stats(db)]
+def _bursts(act, min_len=3):
+    d = np.diff(np.r_[0, act.astype(int), 0])
+    st, en = np.where(d == 1)[0], np.where(d == -1)[0]
+    keep = (en - st) >= min_len
+    return st[keep], en[keep]
+
+
+def voice_stats(db, f0, ap, hop_s=HOP_MFCC / SR):
+    """목소리 질·음높이 윤곽 14개(소리 나는 프레임): 유성 비율, 음높이 중앙값·사분위 범위·상위 10%(반음),
+    과발성 비율(1kHz 초과), jitter(이웃 프레임 음높이 변화, 반음), shimmer(이웃 프레임 세기 변화, dB), HNR(dB, YIN 비주기성),
+    울음 덩어리 안 음높이 기울기(반음/초)·곡률(반음/초²), 오르는·내리는 덩어리 비율, 덩어리 안 음높이 폭, 시작 음높이 튐."""
+    db, f0, ap = (np.asarray(v, float) for v in (db, f0, ap))
+    act = db > db.max() - 30
+    v = act & ~np.isnan(f0)
+    st = np.full(len(f0), np.nan)
+    st[v] = 12 * np.log2(f0[v] / 100)
+    out = np.zeros(14)
+    out[0] = v.sum() / max(act.sum(), 1)
+    if v.sum() < 3:
+        return out
+    sv = st[v]
+    out[1], out[2], out[3] = np.median(sv), np.subtract(*np.percentile(sv, [75, 25])), np.percentile(sv, 90)
+    out[4] = np.mean(f0[v] > 1000)
+    pair = v[1:] & v[:-1]
+    if pair.any():
+        out[5] = np.median(np.abs(np.diff(st))[pair])
+        out[6] = np.median(np.abs(np.diff(db))[pair])
+    a = np.clip(ap[v], 1e-3, 1 - 1e-3)
+    out[7] = np.median(10 * np.log10((1 - a) / a))
+    slopes, curvs, ranges, jumps = [], [], [], []
+    for s0, e0 in zip(*_bursts(act)):
+        idx = np.arange(s0, e0)[v[s0:e0]]
+        if len(idx) < 4:
+            continue
+        tt = (idx - idx[0]) * hop_s
+        c2, c1, _ = np.polyfit(tt, st[idx], 2) if len(idx) >= 5 else (0.0, *np.polyfit(tt, st[idx], 1))
+        slopes.append(np.polyfit(tt, st[idx], 1)[0])
+        curvs.append(c2)
+        ranges.append(np.ptp(st[idx]))
+        jumps.append(st[idx[:3]].mean() - np.median(st[idx]))
+    if slopes:
+        sl = np.array(slopes)
+        out[8], out[9] = np.mean(sl), np.mean(curvs)
+        out[10], out[11] = np.mean(sl > 2), np.mean(sl < -2)
+        out[12], out[13] = np.mean(ranges), np.mean(jumps)
+    return np.nan_to_num(out)
+
+
+def spectral_stats(sp, db):
+    """스펙트럼 프레임 특징 10개의 평균·표준편차(소리 나는 프레임) 20개."""
+    act = db > db.max() - 30
+    sp = np.asarray(sp, float)
+    sp = sp[act] if act.sum() >= 3 else sp
+    return np.r_[sp.mean(0), sp.std(0)]
+
+
+AUDIO_SLICES = {"mfcc": (0, 40), "rhythm": (40, 48), "voice": (48, 62), "spectral": (62, 82)}
+
+
+def audio_stats(mf, db, f0=None, ap=None, sp=None):
+    """울음마다 저장하는 소리 통계 = MFCC 40 + 리듬 8 (+ 목소리 14 + 스펙트럼 20 = 82개)."""
+    base = np.r_[mfcc_stats(mf, db), rhythm_stats(db)]
+    if f0 is None:
+        return base
+    return np.r_[base, voice_stats(db, f0, ap), spectral_stats(sp, db)]
 
 
 def _pack(v, dtype=np.float16):
@@ -122,7 +254,7 @@ def _unpack(s, dtype=np.float16):
 
 class CryPersonal:
     def __init__(self, basis_path, ctx_path=None, state_path=None, k_min=10, temp=3.0, show_min=0.5,
-                 hint_seconds=10, half_life=8, w_sound=1.0, proto_from="all", sound_method="proto", k_nn=3, show2_min=0.0,
+                 hint_seconds=10, half_life=8, w_sound=1.0, proto_from="all", sound_method="lda", k_nn=3, show2_min=0.0,
                  acoustic_path=None, blocks=None, actions=None, gate=True, gate_n=8, gate_window=20, gate_margin=2,
                  track_from=5, use_not=True, semi=False, w_semi=0.5, lda_max_dim=12, ctx_mode="global", ctx_lambda=3.0,
                  ctx_min=5):
@@ -141,13 +273,17 @@ class CryPersonal:
         self.mel_fb = np.asarray(a["mel_fb"], float) if "mel_fb" in a else None
         self.mfcc_norm = (np.asarray(a["mfcc_mean"], float), np.asarray(a["mfcc_std"], float)) if "mfcc_mean" in a else None
         self.dct = dct_matrix(N_MFCC, self.mel_fb.shape[0]) if self.mel_fb is not None else None
-        self.rhythm_norm = (np.asarray(a["rhythm_mean"], float), np.asarray(a["rhythm_std"], float)) \
-            if "rhythm_mean" in a else None
-        ok = {"yamnet16": True, "acoustic": self.ac is not None, "mfcc": self.mfcc_norm is not None,
-              "rhythm": self.rhythm_norm is not None}
-        want = blocks or [k for k in ("acoustic", "mfcc", "rhythm") if ok[k]] or ["yamnet16"]
+        # 소리 통계 블록(MFCC 40 · 리듬 8 · 목소리 14 · 스펙트럼 20)의 공개 데이터 기준 표준화
+        self.norm = {k: (np.asarray(a[f"{k}_mean"], float), np.asarray(a[f"{k}_std"], float))
+                     for k in AUDIO_SLICES if f"{k}_mean" in a}
+        self.rhythm_norm = self.norm.get("rhythm")
+        ok = {"yamnet16": True, "acoustic": self.ac is not None, **{k: k in self.norm for k in AUDIO_SLICES}}
+        # 기본 = 쓸 수 있는 블록 전부(변환 파일이 없으면 YAMNet 16만). 정답을 8가지 특징으로 만든 가상 세계 평균에서
+        #   전부 + 아기별 판별 분석이 가장 높았다(13차: 0.612 / 0.877, 예전 음향+MFCC+리듬 0.579 / 0.862)
+        full = ("yamnet16", "acoustic", "mfcc", "rhythm", "voice", "spectral")
+        want = blocks or ([k for k in full if ok[k]] if self.ac is not None else ["yamnet16"])
         self.blocks = [k for k in want if ok[k]] or ["yamnet16"]
-        self.w = {k: 1.0 / float(a.get(f"spread_{k}", 1.0)) for k in ("yamnet16", "acoustic", "mfcc", "rhythm")}
+        self.w = {k: 1.0 / float(a.get(f"spread_{k}", 1.0)) for k in ("yamnet16", "acoustic", *AUDIO_SLICES)}
         self.space = "+".join(self.blocks)
         self.ctx = None
         c = ctx_path if isinstance(ctx_path, dict) else (
@@ -188,7 +324,7 @@ class CryPersonal:
 
     # --- 울음 구간 ---------------------------------------------------------------
     def start(self, t):
-        self.cur = {"t0": t, "embs": [], "mf": [], "db": []}
+        self.cur = {"t0": t, "embs": [], "mf": [], "db": [], "f0": [], "ap": [], "sp": []}
 
     def add_window(self, emb, audio=None):
         """울음으로 판정된 1초 창의 YAMNet 임베딩(1024)과 그 창의 소리(16kHz, MFCC 블록을 쓸 때)."""
@@ -196,7 +332,12 @@ class CryPersonal:
             return
         self.cur["embs"].append(np.asarray(emb, np.float32))
         if audio is not None and self.mel_fb is not None:
-            mf, db = mfcc_frames(audio, self.mel_fb, self.dct)
+            if any(k in self.blocks for k in ("voice", "spectral")):
+                mf, db, f0, ap, sp = frame_features(audio, self.mel_fb, self.dct)
+                for key, v in (("f0", f0), ("ap", ap), ("sp", sp)):
+                    self.cur[key].append(v.astype(np.float32))
+            else:
+                mf, db = mfcc_frames(audio, self.mel_fb, self.dct)
             self.cur["mf"].append(mf.astype(np.float32))
             self.cur["db"].append(db.astype(np.float32))
 
@@ -204,7 +345,10 @@ class CryPersonal:
         if not self.cur or not self.cur["mf"]:
             return None
         k = slice(None) if n_windows is None else slice(0, n_windows)
-        return audio_stats(np.concatenate(self.cur["mf"][k]), np.concatenate(self.cur["db"][k]))
+        cat = lambda key: np.concatenate(self.cur[key][k])  # noqa: E731
+        if self.cur["f0"]:
+            return audio_stats(cat("mf"), cat("db"), cat("f0"), cat("ap"), cat("sp"))
+        return audio_stats(cat("mf"), cat("db"))
 
     def end(self, t, mfcc=None):
         """울음이 끝났을 때 호출. 저장한 울음 번호를 돌려준다(부모 답을 받을 때 쓴다).
@@ -307,12 +451,10 @@ class CryPersonal:
             if k == "acoustic":
                 xm, xs, W, b = self.ac
                 v = ((emb - xm) / xs) @ W.T + b
-            elif k == "mfcc":
-                mm, ms = self.mfcc_norm
-                v = np.zeros(len(mm)) if m is None else (np.asarray(m, float)[: len(mm)] - mm) / ms
-            elif k == "rhythm":                                   # 소리 통계 48개 중 뒤 8개(예전 기록은 0)
-                rm, rs = self.rhythm_norm
-                v = np.zeros(len(rm)) if m is None or len(m) < 48 else (np.asarray(m, float)[40:48] - rm) / rs
+            elif k in AUDIO_SLICES:                               # 소리 통계에서 그 블록 구간(없는 예전 기록은 0)
+                lo, hi = AUDIO_SLICES[k]
+                mu_, sd_ = self.norm[k]
+                v = np.zeros(hi - lo) if m is None or len(m) < hi else (np.asarray(m, float)[lo:hi] - mu_) / sd_
             else:
                 v = ((emb - self.mu) / self.sd) @ self.P
             out.append(v * self.w[k])

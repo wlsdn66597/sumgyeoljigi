@@ -1,5 +1,7 @@
 # 울음 분류 (YAMNet 전이학습)
 
+> **코드 정리 안내 (2026-10-19)**: 지금 쓰는 코드만 남겼다 — 실시간 감지(`yamnet_cry.py`, `infer.py`, `features.py`, `config.py`), 변환(`export_yamnet_tflite.py`), 파이 힌트 모듈(`../cry_personal.py`)과 그 시험·배포 파일 생성(`sim_kclass.py`, `sim_space.py`, `sim_augment.py`, `sim_personal.py`). 아래 1~8차에 나오는 실험 코드(`train.py`, `joint_*.py`, `enes_v3.py`, `enes_personal.py`, `sim_synthetic.py`, `eval_research.py`, `augment.py` 등)는 태그 `archive/experiments-2026-10-19`에 보관돼 있다. 흐름 요약은 `../docs/CRY_SIMULATION.md`.
+
 **2단계 설계**
 1. **울음 감지(is_crying)**: YAMNet에 내장된 AudioSet `Baby cry, infant cry` 점수를 그대로 쓴다. 별도 학습은 필요 없고, 실시간 경로는 `yamnet_cry.py`(tflite)다.
 2. **울음 이유 3클래스 분류(실험적)**: YAMNet 세그먼트 임베딩(1024-d)을 커스텀 헤드에 넣는다.

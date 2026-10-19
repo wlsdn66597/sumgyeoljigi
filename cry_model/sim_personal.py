@@ -101,8 +101,10 @@ def cmd_basis(_):
 
 # --- Enes 울음(bout) 테이블 ------------------------------------------------------------
 def bouts():
-    import enes_v3 as ev
-    m = ev.load_meta()
+    m = pd.read_csv(os.path.join(ENES3, "meta.csv"), dtype={"date": str, "time": str})
+    # 파일명 하나가 날짜·시각 경계가 한 칸 밀려 있다(101020192_058 = 10102019_2058). 붙여서 다시 자른다.
+    dt = (m.date.str.zfill(8) + m.time.str.zfill(4)).where(m.date.str.len() <= 8, m.date + m.time)
+    m["t"] = pd.to_datetime(dt.str[:12], format="%d%m%Y%H%M", errors="coerce")
     z = np.load(os.path.join(ENES3, "feats", "device_yamnet.npz"), allow_pickle=True)
     assert (z["ids"] == m.id.values).all()
     X, C, ep = z["X"], z["cry"], z["ep"]

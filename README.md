@@ -31,7 +31,7 @@
 
 주요 모듈은 다음과 같습니다.
 
-- `radar_dsp.py`, `radar_sim_signal.py`: 레이더 신호 처리와 합성 신호 생성
+- `radar_dsp.py`: 레이더 신호 처리
 - `cry_classifier.py`, `cry_context.py`: 울음 감지와 환경·시간 맥락 분석
 - `fusion.py`: 멀티모달 융합 판단과 디바운스·쿨다운
 - `sleep_state.py`, `sleep_rhythm.py`: 수면/각성 분류와 수면 리듬 요약
@@ -57,7 +57,7 @@
 | 알림 안정화 | 스트리밍 검증에서 알림 4건에서 1건, 일시 오경보 3건에서 0건 |
 | 수면 리듬 | 합성 5박 데이터에서 안정 수면 87%, 자주 깬 시간대 확인 |
 
-`run_all.sh`를 실행하면 위 항목을 순서대로 재검증하고 결과 파일을 다시 생성합니다.
+위 항목을 재검증하는 스크립트(`run_all.sh`, `eval_*.py`)는 저장소를 정리하면서 태그 `archive/experiments-2026-10-19`에 보관했습니다(`git checkout archive/experiments-2026-10-19`).
 
 ## 실행 방법
 
@@ -66,7 +66,6 @@ python3 -m venv .venv
 source .venv/bin/activate
 pip install -r requirements.txt
 
-bash run_all.sh        # 검증 파이프라인 실행
 streamlit run app.py   # 대시보드 실행
 ```
 

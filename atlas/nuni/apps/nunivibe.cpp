@@ -71,6 +71,9 @@ class PeripheralGpio : public Gpio {
   explicit PeripheralGpio(const std::string& name) {
     conn_ = sdbus::createSystemBusConnection();
     auto mgr = sdbus::createProxy(*conn_, sdbus::ServiceName(kSvc), sdbus::ObjectPath("/com/atlas/PeripheralManager1"));
+    // 부팅 직후에는 Peripherals를 한 번 읽기 전까지 EnablePeripheral이 PeripheralNotFound를 낸다(2026-10-20 Pi 4,
+    // 재부팅 뒤 59번 연속 실패 → busctl로 Peripherals를 읽은 다음부터 성공). 그래서 먼저 목록을 읽는다.
+    mgr->getProperty("Peripherals").onInterface(kSvc).get<std::vector<sdbus::Struct<std::string, std::string>>>();
     // 이전 실행이 켜 둔 채 끝났으면 PeripheralAlreadyEnabled — 그때는 정해진 경로를 그대로 쓴다
     sdbus::ObjectPath path("/com/atlas/PeripheralManager1/" + name);
     try {
@@ -204,14 +207,18 @@ int main(int argc, char** argv) {
 
   std::unique_ptr<Gpio> gpio;
 #ifdef NUNI_WITH_DBUS
-  if (!dry) {
+  // 주변장치 관리 서비스가 늦게 준비될 수 있어, 끝내지 않고 3초마다 다시 연다(실패 로그는 처음과 10번마다)
+  for (int attempt = 1; !dry && !gpio && !g_stop; ++attempt) {
     try {
       gpio = std::make_unique<PeripheralGpio>(pin);
     } catch (const sdbus::Error& e) {
-      std::cerr << "[vibe] GPIO 열기 실패: " << e.getName() << " — " << e.getMessage() << "\n";
-      return 1;
+      if (attempt == 1 || attempt % 10 == 0)
+        std::cerr << "[vibe] GPIO 열기 실패(" << attempt << "번째): " << e.getName() << " — " << e.getMessage()
+                  << " — 3초 뒤 다시 시도\n";
+      std::this_thread::sleep_for(std::chrono::seconds(3));
     }
   }
+  if (g_stop) return 0;
 #else
   if (!dry) std::cerr << "[vibe] sdbus-c++ 없이 빌드됨 — 로그만 남깁니다\n";
 #endif

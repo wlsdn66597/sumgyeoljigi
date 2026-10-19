@@ -2,7 +2,7 @@
 # 설치: deploy/setup_vibe_on_device.sh (nunivibe를 /data/nuni/vibe에 두고 이 유닛을 등록한다)
 [Unit]
 Description=Nuni vibration node (fusion/alert -> GPIO)
-After=network-online.target
+After=network-online.target peripheral-manager.service
 Wants=network-online.target
 
 [Service]

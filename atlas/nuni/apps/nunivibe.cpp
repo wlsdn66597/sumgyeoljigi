@@ -7,7 +7,7 @@
 // → WriteValue(1/0). 기본 ActiveType은 ACTIVE_LOW라 1을 쓰면 핀이 LOW가 되므로 먼저 바꾼다.
 // PWM이 없어 세기 조절은 못 하고 켜고 끄는 패턴만 낸다. 진동 모듈은 드라이버(트랜지스터) 모듈을 거쳐 연결한다.
 //
-// 설정(환경변수): NUNI_MQTT_HOST(기본 172.20.10.2 = 파이 5), NUNI_MQTT_PORT, NUNI_VIBE_GPIO(기본 18),
+// 설정(환경변수): NUNI_MQTT_HOST(기본 172.20.10.13 = 파이 5), NUNI_MQTT_PORT, NUNI_VIBE_GPIO(기본 18),
 //                NUNI_VIBE_DRY=1이면 GPIO 없이 로그만.
 #include <signal.h>
 #include <unistd.h>
@@ -182,7 +182,7 @@ class Vibrator {
 }  // namespace
 
 int main(int argc, char** argv) {
-  std::string host = env_str("NUNI_MQTT_HOST", "172.20.10.2");
+  std::string host = env_str("NUNI_MQTT_HOST", "172.20.10.13");
   int port = std::atoi(env_str("NUNI_MQTT_PORT", "1883").c_str());
   std::string pin = "GPIO_" + env_str("NUNI_VIBE_GPIO", "18");
   bool dry = env_str("NUNI_VIBE_DRY", "0") == "1";
@@ -195,7 +195,7 @@ int main(int argc, char** argv) {
     else if (a == "--test") test_only = true;
     else {
       std::cout << "사용법: " << argv[0] << " [--host H] [--gpio N] [--dry] [--test]\n"
-                << "  환경변수 NUNI_MQTT_HOST(기본 172.20.10.2), NUNI_MQTT_PORT, NUNI_VIBE_GPIO(기본 18), NUNI_VIBE_DRY=1\n";
+                << "  환경변수 NUNI_MQTT_HOST(기본 172.20.10.13), NUNI_MQTT_PORT, NUNI_VIBE_GPIO(기본 18), NUNI_VIBE_DRY=1\n";
       return a == "--help" || a == "-h" ? 0 : 2;
     }
   }

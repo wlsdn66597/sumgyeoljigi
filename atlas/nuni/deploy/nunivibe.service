@@ -8,7 +8,7 @@ Wants=network-online.target
 [Service]
 Type=simple
 ExecStart=/data/nuni/vibe/nunivibe
-Environment=NUNI_MQTT_HOST=172.20.10.2
+Environment=NUNI_MQTT_HOST=172.20.10.13
 Environment=NUNI_VIBE_GPIO=18
 Restart=always
 RestartSec=3

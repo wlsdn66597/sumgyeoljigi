@@ -56,10 +56,10 @@
 ## 기기 구성과 실측 (2026-10-19)
 
 ```
-[파이 5 메인 172.20.10.2]  마이크(AB13X) → nunifusion(ECO.AI YAMNet) ─┐
+[파이 5 메인 172.20.10.13] 마이크(AB13X) → nunifusion(ECO.AI YAMNet) ─┐
                            nuni-mosquitto(브로커) ◀───────────────────┘
                                   │ fusion/alert, control/vibrate
-[파이 4 172.20.10.3]       nunivibe → PeripheralManager1 GPIO_18 → 진동 모듈
+[파이 4 172.20.10.12]      nunivibe → PeripheralManager1 GPIO_18 → 진동 모듈
 ```
 
 | 확인 | 결과 |
@@ -176,8 +176,12 @@ arc run -d rpi -s com.atlas.NuniFusion1 -p '[GetState]'
 
 - GPIO는 PeripheralManager1로 다룬다: `EnablePeripheral` → `ActiveType=0`(ACTIVE_HIGH) → `Open(1)` → `WriteValue`. 사양서의 기본값은 ACTIVE_LOW라 1을 쓰면 핀이 LOW가 될 수 있어 먼저 확인한다(Pi 4에서는 이미 0이었고 Set은 internal error를 냈다).
 - PWM이 없어 세기 조절은 못 한다. 진동 모듈은 드라이버(트랜지스터) 모듈을 거쳐 연결한다.
-- 설정: `NUNI_MQTT_HOST`(기본 172.20.10.2 = 파이 5), `NUNI_VIBE_GPIO`(기본 18), `NUNI_VIBE_DRY=1`(로그만). `nunivibe --test`는 브로커 없이 시험 패턴을 한 번 낸다.
-- 핫스팟 DHCP라 파이 5 주소가 바뀌면 `nunivibe.service`의 `NUNI_MQTT_HOST`를 고치고 `setup_vibe_on_device.sh`를 다시 실행한다.
+- 설정: `NUNI_MQTT_HOST`(기본 172.20.10.13 = 파이 5), `NUNI_VIBE_GPIO`(기본 18), `NUNI_VIBE_DRY=1`(로그만). `nunivibe --test`는 브로커 없이 시험 패턴을 한 번 낸다.
+- IP는 두 파이 모두 ConnMan으로 고정했다(아이폰 핫스팟 `jinu` 프로필에만 적용, 다른 WiFi는 DHCP). 아이폰은 `.2`부터 차례로 나눠 주므로 겹치지 않게 뒤쪽 번호를 쓴다.
+  ```
+  connmanctl config wifi_<ID>_managed_psk --ipv4 manual 172.20.10.13 255.255.255.240 172.20.10.1 --nameservers 172.20.10.1   # 파이 5 (파이 4는 .12)
+  ```
+  되돌리기: `--ipv4 dhcp`. 주소를 바꾸면 `nunivibe.service`의 `NUNI_MQTT_HOST`를 고치고 `setup_vibe_on_device.sh`를 다시 실행한다.
 
 ## 기기에서 확인할 것
 

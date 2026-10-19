@@ -3,6 +3,7 @@
     python sim_kclass.py feats --workers 12   # 울음 2,521개: 파이식 MFCC(울음 판정 창만) + 스펙트럼 모양 + (Enes) 리듬
     python sim_kclass.py export               # artifacts/cry_personal_acoustic.npz에 MFCC 멜 필터·표준화·블록 퍼짐을 더한다
     python sim_kclass.py run --workers 12     # → DATA/runs/synthetic/KCLASS_REPORT.md
+    python sim_kclass.py long13 --workers 8   # 13차 기본값으로 긴 사용 기간(아기 11명 → 울음 약 275개) → KCLASS_LONG13_REPORT_g11.md
 
 정답 세계: ③ 아기마다 다른 규칙을 특징 6묶음으로 만든다(아기 안 표준화 → k-평균 → 유형 크기를 정한 비율로 배정).
   요약 6 / eGeMAPS / MFCC / YAMNet / 스펙트럼 모양(대비·평탄도·롤오프·대역폭·영교차) / 리듬(음절 속도·쉼·유성 비율·길이)
@@ -724,6 +725,85 @@ def report_voice(D):
     print(txt)
 
 
+# --- 8. 13차 기본값으로 긴 사용 기간 (답이 몇 개 쌓이면 쓸 만한가) ---------------------------------------
+# `long`(10차)은 그때 설정(음향 변환 + MFCC, proto)으로 고정돼 있어 13차 기본값을 재지 않는다. 이 시험은 13차와 같은
+# 8가지 정답 세계·같은 재생(replay_more)을 쓰고, 가상 아기만 길게(아기 11명 → 울음 약 275개) 만든다.
+LONG13_CFG = {"이력만": dict(w_sound=0.0),
+              "12차 기본 (음향+MFCC+리듬, 자가 검증)": dict(blocks=["acoustic", "mfcc", "rhythm"]),
+              "13차 기본 (전부 + 아기별 판별 분석, 자가 검증)": dict(sound_method="lda"),
+              "13차, 자가 검증 끔": dict(sound_method="lda", gate=False)}
+LONG13_BUCKETS = [(10, 19), (20, 39), (40, 79), (80, 119), (120, 159), (160, 199), (200, 999)]
+
+
+def _long13_task(job):
+    world, seed, gsize, answers = job
+    m = _W["m"]
+    F = mixed_world(seed) if world == "혼합" else None
+    vorder, En, Mn, Fn = _virtual(world, seed, gsize, F)
+    y = baby_rule(m, Fn, vorder, 3, None, seed)
+    rec = replay_more(y, cp.ACTIONS3, vorder, En, Mn, seed, list(LONG13_CFG), answers, LONG13_CFG)
+    return [("sim", world, seed) + r for r in rec]
+
+
+def cmd_long13(a):
+    """13차 기본값(파이 모듈 기본: 블록 6개 + 아기별 판별 분석 + 자가 검증)을 긴 사용 기간으로 잰다.
+    칸 = 그 구간 울음의 1순위 균형 정확도 / 2순위 안 적중률을 (세계, 시드)마다 내서 8개 세계 평균."""
+    import warnings
+    from multiprocessing import Pool
+    warnings.filterwarnings("ignore")
+    answers = ["답 100%"] + (["답 50%"] if a.half else [])
+    jobs = [(w, s, a.group, answers) for w in VOICE_WORLDS for s in range(a.seeds)]
+    rows, t0 = [], time.time()
+    with Pool(a.workers, initializer=_init_run) as pool:
+        for n, r in enumerate(pool.imap_unordered(_long13_task, jobs)):
+            rows += r
+            if (n + 1) % 8 == 0:
+                print(f"  {n + 1}/{len(jobs)} {time.time() - t0:.0f}s", flush=True)
+    D = pd.DataFrame(rows, columns=["kind", "world", "seed", "cfg", "ans", "y", "pred", "hit2", "pos", "on"])
+    tag = f"_g{a.group}"
+    os.makedirs(sa.RUNS, exist_ok=True)
+    D.to_csv(os.path.join(sa.RUNS, f"kclass_long13{tag}.csv"), index=False)
+    report_long13(D, a.group, a.seeds)
+
+
+def report_long13(D, group, seeds):
+    worlds = [w for w in VOICE_WORLDS if w in set(D.world)]
+    nb = 22 // group
+    lab = lambda lo, hi: f"{lo}~{hi}" if hi < 999 else f"{lo}+"  # noqa: E731
+    L = [f"# 13차 기본값의 긴 사용 기간 — 쌓인 답 수별 정확도 (행동 3개, 아기 {group}명을 이어 붙인 가상 아기, 울음 약 {25 * group}개)", "",
+         f"- 가상 아기 {nb}명 × 시드 {seeds}개 × 정답 세계 {len(worlds)}가지(13차와 같음: 특징 묶음 7가지 + 혼합). "
+         "아기마다 평균을 빼 목소리 차이를 지우고 시간 순서를 지켜 번갈아 넣었다.",
+         "- 칸 = 그 구간 울음의 1순위 균형 정확도 / 정답이 1·2순위 안에 든 비율(행동별 평균). 무작위 0.33 / 0.67.",
+         "- 구간 = 몇 번째 울음인지. 답 100%면 그때까지 쌓인 답 수와 같다. 힌트는 답 10개부터 보인다.",
+         "- 13차 기본은 블록 6개를 모두 써서 혼합 외 7개 세계와 특징이 겹친다(순환). 혼합 세계 줄을 함께 본다.", ""]
+    for aname in dict.fromkeys(D.ans):
+        A = D[D.ans == aname]
+        for title, ws in ((f"{len(worlds)}개 세계 평균 ({aname})", worlds), (f"혼합 세계만 ({aname})", ["혼합"])):
+            if not set(ws) & set(A.world):
+                continue
+            L += [f"## {title}", "", "| 설정 | " + " | ".join(f"울음 {lab(lo, hi)}번째" for lo, hi in LONG13_BUCKETS) + " | 소리 켜짐(20번째~) |",
+                  "|---|" + "---:|" * (len(LONG13_BUCKETS) + 1)]
+            for c in LONG13_CFG:
+                g = A[(A.cfg == c) & A.world.isin(ws)]
+                if g.empty:
+                    continue
+                cells = []
+                for lo, hi in LONG13_BUCKETS:
+                    x = g[(g.pos >= lo) & (g.pos <= hi)]
+                    if len(x) < 50 * len(ws):
+                        cells.append("-")
+                        continue
+                    v = np.mean([_score(x[x.world == w]) for w in ws if (x.world == w).any()], 0)
+                    cells.append(f"{v[0]:.2f} / {v[1]:.2f}")
+                on = f"{g[g.pos >= 20].on.mean():.0%}" if "자가 검증)" in c else "-"
+                L.append(f"| {c} | " + " | ".join(cells) + f" | {on} |")
+            n = [int(((A.cfg == "이력만") & A.world.isin(ws) & (A.pos >= lo) & (A.pos <= hi)).sum()) for lo, hi in LONG13_BUCKETS]
+            L += ["| (울음 수) | " + " | ".join(str(v) for v in n) + " | |", ""]
+    txt = "\n".join(L) + "\n"
+    open(os.path.join(sa.RUNS, f"KCLASS_LONG13_REPORT_g{group}.md"), "w", encoding="utf-8").write(txt)
+    print(txt)
+
+
 def main():
     ap = argparse.ArgumentParser()
     sp = ap.add_subparsers(dest="cmd", required=True)
@@ -751,9 +831,14 @@ def main():
     p = sp.add_parser("voice")
     p.add_argument("--workers", type=int, default=4)
     p.add_argument("--seeds", type=int, default=6)
+    p = sp.add_parser("long13", help="13차 기본값으로 긴 사용 기간(답 수별 정확도)")
+    p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--seeds", type=int, default=12)
+    p.add_argument("--group", type=int, default=11, help="가상 아기 하나에 묶을 Enes 아기 수(11이면 울음 약 275개)")
+    p.add_argument("--half", action="store_true", help="부모가 절반만 답하는 경우(답 50%%)도 함께 잰다")
     a = ap.parse_args()
     {"feats": cmd_feats, "export": cmd_export, "run": cmd_run, "long": cmd_long, "more": cmd_more,
-     "rhythm": cmd_rhythm, "voice": cmd_voice}[a.cmd](a)
+     "rhythm": cmd_rhythm, "voice": cmd_voice, "long13": cmd_long13}[a.cmd](a)
 
 
 if __name__ == "__main__":

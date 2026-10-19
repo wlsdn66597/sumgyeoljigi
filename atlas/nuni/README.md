@@ -53,7 +53,23 @@
 | 같은 비교를 ARM64(aarch64, qemu)로 | 약 10만 줄 | **완전 일치** (`-ffp-contract=off`가 없으면 리샘플 2건이 마지막 자리에서 달랐음 → 넣음) |
 | 메모리 검사(AddressSanitizer·UBSan) | 2.4만 줄 | 오류 없음 |
 
-기기(atlas Pi 4)에서는 아직 돌려 보지 않았다. 아래 '기기에서 확인할 것'을 먼저 본다.
+## 기기 구성과 실측 (2026-10-19)
+
+```
+[파이 5 메인 172.20.10.2]  마이크(AB13X) → nunifusion(ECO.AI YAMNet) ─┐
+                           nuni-mosquitto(브로커) ◀───────────────────┘
+                                  │ fusion/alert, control/vibrate
+[파이 4 172.20.10.3]       nunivibe → PeripheralManager1 GPIO_18 → 진동 모듈
+```
+
+| 확인 | 결과 |
+|---|---|
+| 파이 5: IPK 설치(`PackageManager1.Install`) + `setup_on_device.sh` | ✅ `nunifusion`·`nuni-mosquitto` active, 부팅 자동 실행 등록, D-Bus `Ping` → `pong:2` |
+| 파이 5: 울음 추론 | ✅ ECO.AI(TfLiteStrategy, cpu)로 마이크 1.5초 창 판정 13ms (2스레드) |
+| 파이 4: `nunivibe` | ✅ 파이 5 브로커 접속, `control/vibrate`(test)·`fusion/alert`(alert) 받아 GPIO_18 패턴 출력 |
+| 노트북 → 파이 5 브로커 → 파이 4 | ✅ 경보 한 건이 진동 패턴까지 이어짐 |
+
+아직 안 한 것: 진동 모듈 실물 연결(핀 값은 ReadValue로만 확인), 레이더(ESP32) 연결, Flutter 앱의 D-Bus 신호 구독.
 
 ## 빌드
 
@@ -68,7 +84,9 @@ make -j
 
 - TFLite는 `pkg-config tensorflowlite`(SDK)로 찾고, CPU(XNNPACK)에 필요한 `tensorflowlite`·`tensorflowlite_xnnpack_delegate`만 링크한다(`atlas/yamnet_test`와 같음).
 - 실행 파일은 옆의 `lib/`에서 공유 라이브러리를 먼저 찾는다(RPATH `$ORIGIN/lib`). 기기 시스템 경로는 건드리지 않는다.
-- IPK는 LG 샘플처럼 `arc build`로 만든다. `CMakeLists.txt`의 install 규칙과 `files/` 구조를 샘플(`lifecycleservice`)과 같게 맞췄다.
+- IPK는 LG 샘플처럼 `arc build`로 만든다. 단, `arc build`는 CMake install 규칙을 쓰지 않고 실행 파일·`serviceinfo.json`·D-Bus 파일만 묶는다(2026-10-19 확인). 모델·브로커·systemd 유닛·`setup_on_device.sh`는 아래 '기기에 올리기'처럼 서비스 폴더에 따로 넣는다.
+- ECO.AI(`pkg-config ecoai-inference`)가 있으면 같이 빌드한다. 실행 때 `NUNI_YAMNET_ENGINE=auto`면 ECO.AI를 먼저 쓰고, 추론 플러그인이 없는 기기(Pi 4)에서는 TFLite 직접으로 넘어간다.
+- `nunivibe`(파이 4 진동 노드)도 같은 빌드에서 나온다.
 
 일반 리눅스 PC에서도 같은 명령으로 빌드된다. 없는 라이브러리 기능만 빠진다(예: TFLite가 없으면 울음 감지 없이 레이더·융합만).
 
@@ -84,12 +102,24 @@ make -j
 
 ```bash
 # 개발 컨테이너
-cd atlas/nuni && arc build
-arc install ./build/arm64/ipk/com.atlas.NuniFusion1.ipk -d rpi
+cd atlas/nuni && arc build          # → build/arm64/ipk/com.atlas.NuniFusion1.ipk
 
-# 기기(root) — 설치만으로는 서비스가 안 뜬다. 샘플에서 겪은 함정 5가지를 이 스크립트가 처리한다
-sh /data/share/usr/atlas/services/com.atlas.NuniFusion1/setup_on_device.sh
+# 파이 5(root) — IPK를 /tmp에 복사한 뒤 플랫폼 패키지 매니저로 설치한다
+#   (WSL 컨테이너에서는 핫스팟 대역으로 접속이 안 돼 arc install 대신 이렇게 했다)
+busctl --system call com.atlas.PackageManager1 /com/atlas/PackageManager1 com.atlas.PackageManager1 \
+  Install ss com.atlas.NuniFusion1 /tmp/com.atlas.NuniFusion1.ipk
+SVC=/data/share/usr/atlas/services/com.atlas.NuniFusion1
+mkdir -p $SVC/systemd $SVC/mosquitto
+cp yamnet_emb.tflite setup_on_device.sh $SVC/
+cp deploy/nunifusion.service deploy/nuni-mosquitto.service $SVC/systemd/
+cp mosquitto mosquitto.conf $SVC/mosquitto/        # build_mosquitto.sh 결과
+# 설치만으로는 서비스가 안 뜬다. 샘플에서 겪은 함정 5가지를 이 스크립트가 처리한다
+sh $SVC/setup_on_device.sh
 journalctl -u nunifusion -f
+
+# 파이 4(root) — 진동 노드. /data/nuni/vibe/에 nunivibe, deploy/nunivibe.service, deploy/setup_vibe_on_device.sh를 둔다
+sh /data/nuni/vibe/setup_vibe_on_device.sh
+journalctl -u nunivibe -f
 ```
 
 `setup_on_device.sh`가 하는 일:
@@ -108,10 +138,12 @@ journalctl -u nunifusion -f
 | `NUNI_DBUS_BUS` | `system` | `session`이면 세션 버스(개발 PC 시험용) |
 | `NUNI_YAMNET_MODEL` | 실행 파일 옆 `yamnet_emb.tflite` → 없으면 `yamnet.tflite` | 모델 |
 | `NUNI_YAMNET_CLASSMAP` | 실행 파일 옆 `yamnet_class_map.csv` | 없으면 클래스 19·20 |
-| `NUNI_YAMNET_THREADS` | 1 | XNNPACK 스레드(기기에서 4스레드 24ms, 1스레드 49ms) |
+| `NUNI_YAMNET_THREADS` | 1 | 추론 스레드(Pi 4 TFLite 4스레드 24ms·1스레드 49ms, Pi 5 ECO.AI 8.8ms) |
+| `NUNI_YAMNET_ENGINE` | `auto` | `auto`(ECO.AI → TFLite 직접) / `ecoai` / `tflite` |
+| `NUNI_ECOAI_BACKEND` | `cpu` | ECO.AI 백엔드. Pi 5에서 `gpu`는 17.5ms로 cpu(8.8ms)보다 느렸다 |
 | `NUNI_CRY_THRESHOLD` | 0.3 | 울음 판정 임계 |
 | `NUNI_MIC_SR` | 48000 | 마이크 샘플레이트(16000이면 리샘플 안 함) |
-| `NUNI_PULSE_SERVER` / `NUNI_PULSE_SOURCE` | 기본 서버·기본 입력 | 기기 PulseAudio는 시스템 모드(`/var/run/pulse/native`) |
+| `NUNI_PULSE_SERVER` / `NUNI_PULSE_SOURCE` | 기본 서버·기본 입력 | 기기 PulseAudio는 시스템 모드(`/run/pulse/native`). 유닛에 USB 마이크 AB13X 이름을 넣어 두었다 |
 | `NUNI_CRY_WAV` | (없음) | 마이크 대신 WAV를 반복 재생(시연·시험) |
 | `NUNI_FUSION_CRY_THRESHOLD` | 0.7 | 수면 상태의 울음 확정 임계(`sleep_state.py`와 같음) |
 | `NUNI_BR_MIN`, `NUNI_APNEA_HOLD_S` 등 | `radar_bridge.py`와 같음 | 레이더 게이팅 |
@@ -134,13 +166,24 @@ busctl call com.atlas.NuniFusion1 /com/atlas/NuniFusion1 com.atlas.NuniFusion1 G
 arc run -d rpi -s com.atlas.NuniFusion1 -p '[GetState]'
 ```
 
+## 진동 노드 `nunivibe` (파이 4)
+
+| 받는 토픽 | 내용 | 패턴 |
+|---|---|---|
+| `fusion/alert` | `level: alert` | 0.8초 켬·0.4초 끔 × 3 |
+| `fusion/alert` | `level: attention` | 0.3초 1번 |
+| `control/vibrate` | `pattern: alert / attention / test` | 손으로 시험할 때 |
+
+- GPIO는 PeripheralManager1로 다룬다: `EnablePeripheral` → `ActiveType=0`(ACTIVE_HIGH) → `Open(1)` → `WriteValue`. 사양서의 기본값은 ACTIVE_LOW라 1을 쓰면 핀이 LOW가 될 수 있어 먼저 확인한다(Pi 4에서는 이미 0이었고 Set은 internal error를 냈다).
+- PWM이 없어 세기 조절은 못 한다. 진동 모듈은 드라이버(트랜지스터) 모듈을 거쳐 연결한다.
+- 설정: `NUNI_MQTT_HOST`(기본 172.20.10.2 = 파이 5), `NUNI_VIBE_GPIO`(기본 18), `NUNI_VIBE_DRY=1`(로그만). `nunivibe --test`는 브로커 없이 시험 패턴을 한 번 낸다.
+- 핫스팟 DHCP라 파이 5 주소가 바뀌면 `nunivibe.service`의 `NUNI_MQTT_HOST`를 고치고 `setup_vibe_on_device.sh`를 다시 실행한다.
+
 ## 기기에서 확인할 것
 
-1. **브로커:** `deploy/build_mosquitto.sh`를 SDK 환경에서 빌드한다. x86에서는 빌드·동작을 확인했다.
-2. **마이크:** USB 마이크를 꽂고 `pactl list short sources`로 입력 장치 이름을 확인한다(9-28에는 입력 장치 0개였음). 필요하면 `NUNI_PULSE_SOURCE`를 지정한다.
-3. **샘플레이트:** 마이크가 48kHz가 아니면 `NUNI_MIC_SR`을 맞춘다. PulseAudio가 알아서 변환하므로 16000으로 받아도 된다.
-4. **판정 시간:** 기기에서 `NUNI_YAMNET_THREADS`를 정한다. 1분마다 로그에 판정 시간이 찍힌다.
-5. **D-Bus 신호 구독:** Flutter 앱이 신호를 받을 수 있는지(권한 키 포함) 확인한다.
+1. **진동 모듈 실물:** 지금은 GPIO_18 값만 확인했다. 모듈을 연결해 실제로 떨리는지, 레이더 측정에 간섭이 없는지 본다.
+2. **판정 시간:** 1분마다 로그에 판정 시간이 찍힌다. Pi 5 ECO.AI 2스레드로 13ms(마이크 창 포함).
+3. **D-Bus 신호 구독:** Flutter 앱이 신호를 받을 수 있는지(권한 키 포함) 확인한다.
 
 ## 원본에서 발견한 점 (동작은 원본과 똑같이 옮겼다)
 
@@ -156,7 +199,8 @@ arc run -d rpi -s com.atlas.NuniFusion1 -p '[GetState]'
 ```
 atlas/nuni/
   CMakeLists.txt        빌드·설치(= IPK 구조)
-  apps/nunifusion.cpp   서비스 진입점(모듈 3개 + D-Bus)
+  apps/nunifusion.cpp   서비스 진입점(모듈 3개 + D-Bus) — 파이 5
+  apps/nunivibe.cpp     진동 노드(fusion/alert → GPIO) — 파이 4
   include/nuni/, src/   이식한 로직과 입출력(MQTT·PulseAudio·TFLite·D-Bus)
   files/                serviceinfo.json, .apptype, D-Bus 정책·활성화 파일(LG 샘플과 같은 자리)
   deploy/               systemd 유닛, 기기 마무리 스크립트, 브로커 빌드 스크립트·설정

@@ -68,6 +68,21 @@ if(HAVE_TFLITE)
   target_compile_definitions(nuni_tflite PUBLIC NUNI_WITH_TFLITE)
 endif()
 
+# ── ECO.AI 통합 API (울음 감지, Pi 5) ────────────────────────────────────────
+# Pi 5 이미지에는 추론 플러그인이 있어 ECO.AI로 돌린다. 플러그인이 없는 기기(Pi 4)에서는 실행 때 TFLite 직접으로 넘어간다.
+set(HAVE_ECOAI OFF)
+if(PkgConfig_FOUND)
+  pkg_check_modules(ECOAI QUIET ecoai-inference)
+  if(ECOAI_FOUND)
+    set(HAVE_ECOAI ON)
+    add_library(nuni_ecoai STATIC src/yamnet_ecoai.cpp)
+    target_include_directories(nuni_ecoai PUBLIC ${ECOAI_INCLUDE_DIRS})
+    target_link_directories(nuni_ecoai PUBLIC ${ECOAI_LIBRARY_DIRS})
+    target_link_libraries(nuni_ecoai PUBLIC nuni_core ${ECOAI_LIBRARIES})
+    target_compile_definitions(nuni_ecoai PUBLIC NUNI_WITH_ECOAI)
+  endif()
+endif()
+
 # ── libpulse (마이크) ────────────────────────────────────────────────────────
 set(HAVE_PULSE OFF)
 if(PkgConfig_FOUND)
@@ -88,13 +103,16 @@ endif()
 if(NUNI_REQUIRE_ALL AND NOT (HAVE_TFLITE AND HAVE_PULSE AND HAVE_SDBUS))
   message(FATAL_ERROR "필요한 라이브러리가 없음: TFLite=${HAVE_TFLITE} libpulse=${HAVE_PULSE} sdbus-c++=${HAVE_SDBUS}")
 endif()
-message(STATUS "nunifusion 기능: TFLite(울음)=${HAVE_TFLITE} libpulse(마이크)=${HAVE_PULSE} sdbus-c++(D-Bus)=${HAVE_SDBUS}")
+message(STATUS "nunifusion 기능: ECO.AI(울음)=${HAVE_ECOAI} TFLite(울음)=${HAVE_TFLITE} libpulse(마이크)=${HAVE_PULSE} sdbus-c++(D-Bus)=${HAVE_SDBUS}")
 
 # ── 서비스 실행 파일 ─────────────────────────────────────────────────────────
 add_executable(nunifusion apps/nunifusion.cpp)
 target_link_libraries(nunifusion PRIVATE nuni_core)
 if(HAVE_TFLITE)
   target_link_libraries(nunifusion PRIVATE nuni_tflite)
+endif()
+if(HAVE_ECOAI)
+  target_link_libraries(nunifusion PRIVATE nuni_ecoai)
 endif()
 if(HAVE_PULSE)
   target_sources(nunifusion PRIVATE src/audio_pulse.cpp)
@@ -108,6 +126,14 @@ if(HAVE_SDBUS)
   target_sources(nunifusion PRIVATE src/dbus_service.cpp)
   target_link_libraries(nunifusion PRIVATE SDBusCpp::sdbus-c++)
   target_compile_definitions(nunifusion PRIVATE NUNI_WITH_DBUS)
+endif()
+
+# ── 파이 4 진동 노드(fusion/alert → PeripheralManager1 GPIO) ────────────────
+add_executable(nunivibe apps/nunivibe.cpp)
+target_link_libraries(nunivibe PRIVATE nuni_core)
+if(HAVE_SDBUS)
+  target_link_libraries(nunivibe PRIVATE SDBusCpp::sdbus-c++)
+  target_compile_definitions(nunivibe PRIVATE NUNI_WITH_DBUS)
 endif()
 
 # ── 시험 도구(Python 원본과 출력 비교) ───────────────────────────────────────

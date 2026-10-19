@@ -14,8 +14,11 @@ ExecStart=/data/share/usr/atlas/services/com.atlas.NuniFusion1/nunifusion
 Environment=NUNI_MQTT_HOST=localhost
 Environment=NUNI_MIC_SR=48000
 Environment=NUNI_YAMNET_THREADS=2
-# Environment=NUNI_PULSE_SERVER=unix:/var/run/pulse/native
-# Environment=NUNI_PULSE_SOURCE=<pactl list short sources 로 확인한 이름>
+# auto = ECO.AI(Pi 5에는 추론 플러그인이 있음) → 없으면 TFLite 직접(Pi 4)
+Environment=NUNI_YAMNET_ENGINE=auto
+# 기기 PulseAudio는 시스템 모드다. 기본 입력이 HDMI 쪽으로 잡힐 수 있어 USB 마이크(AB13X)를 지정한다(2026-10-19 Pi 5 확인)
+Environment=NUNI_PULSE_SERVER=unix:/run/pulse/native
+Environment=NUNI_PULSE_SOURCE=alsa_input.usb-Generic_AB13X_USB_Audio_20210926172016-00.mono-fallback
 Restart=on-failure
 RestartSec=3
 

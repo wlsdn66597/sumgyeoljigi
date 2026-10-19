@@ -2,7 +2,7 @@
 //
 // 한 프로세스에서 세 모듈을 돌린다(각각 끌 수 있음). 모듈끼리는 Python 분산 모드와 똑같이 MQTT 브로커를 거친다.
 //   radar  : ESPHome(mr60bha2/*) 구독 → sensor/radar 1초마다 발행      (radar_bridge.py)
-//   cry    : 마이크(PulseAudio) → YAMNet(TFLite) → audio/cry 1초마다 발행  (cry_classifier.py 실물 경로)
+//   cry    : 마이크(PulseAudio) → YAMNet(ECO.AI, 없으면 TFLite) → audio/cry 1초마다 발행  (cry_classifier.py 실물 경로)
 //   fusion : sensor/radar · audio/cry · sensor/env 구독 → fusion/state · fusion/alert · control/action 발행
 //            (fusion.py + sleep_state.py + env_control.py + personalization.py)
 //   + D-Bus: com.atlas.NuniFusion1 이름을 가져가 서비스 매니저에 RUNNING으로 보이고, 상태를 메서드·신호로 내보낸다.
@@ -29,6 +29,9 @@
 #include "nuni/topics.hpp"
 #ifdef NUNI_WITH_TFLITE
 #include "nuni/yamnet_tflite.hpp"
+#endif
+#ifdef NUNI_WITH_ECOAI
+#include "nuni/yamnet_ecoai.hpp"
 #endif
 #ifdef NUNI_WITH_DBUS
 #include "nuni/dbus_service.hpp"
@@ -85,6 +88,9 @@ struct Options {
   std::string model = env_str("NUNI_YAMNET_MODEL", default_model());
   std::string classmap = env_str("NUNI_YAMNET_CLASSMAP", exe_dir() + "/yamnet_class_map.csv");
   int threads = static_cast<int>(env_num("NUNI_YAMNET_THREADS", 1));
+  // auto: ECO.AI를 먼저 쓰고, 플러그인이 없으면(Pi 4) TFLite 직접. ecoai / tflite로 하나만 쓰게 할 수 있다
+  std::string engine = env_str("NUNI_YAMNET_ENGINE", "auto");
+  std::string ecoai_backend = env_str("NUNI_ECOAI_BACKEND", "cpu");  // Pi 5에서 gpu는 cpu보다 느렸다(17.5ms vs 8.8ms)
   double cry_threshold = env_num("NUNI_CRY_THRESHOLD", 0.3);  // cry_classifier.py CRY_THRESHOLD
   int mic_sr = static_cast<int>(env_num("NUNI_MIC_SR", 48000));  // USB 마이크 고유 레이트(cry_classifier.py)
   std::string pulse_server = env_str("NUNI_PULSE_SERVER"), pulse_source = env_str("NUNI_PULSE_SOURCE");
@@ -100,7 +106,9 @@ void usage(const char* argv0) {
             << "  --classmap PATH         yamnet_class_map.csv (NUNI_YAMNET_CLASSMAP; 없으면 클래스 19·20)\n"
             << "  --wav PATH              마이크 대신 WAV 반복 재생 (NUNI_CRY_WAV)\n"
             << "  --mic-sr N              마이크 샘플레이트 (NUNI_MIC_SR; 기본 48000)\n"
-            << "그 밖의 환경변수: NUNI_CRY_THRESHOLD, NUNI_YAMNET_THREADS, NUNI_PULSE_SERVER, NUNI_PULSE_SOURCE,\n"
+            << "  --engine E              추론 엔진 auto|ecoai|tflite (NUNI_YAMNET_ENGINE; 기본 auto = ECO.AI → TFLite)\n"
+            << "그 밖의 환경변수: NUNI_ECOAI_BACKEND(cpu|gpu), NUNI_CRY_THRESHOLD, NUNI_YAMNET_THREADS,\n"
+            << "  NUNI_PULSE_SERVER, NUNI_PULSE_SOURCE,\n"
             << "  NUNI_FUSION_CRY_THRESHOLD, 레이더 게이팅 값(NUNI_BR_MIN 등, radar_bridge.py와 같음)\n";
 }
 
@@ -125,6 +133,7 @@ bool parse_args(int argc, char** argv, Options& o) {
     else if (a == "--classmap" && next(v)) o.classmap = v;
     else if (a == "--wav" && next(v)) o.wav = v;
     else if (a == "--mic-sr" && next(v)) o.mic_sr = std::atoi(v.c_str());
+    else if (a == "--engine" && next(v)) o.engine = v;
     else {
       std::cerr << "알 수 없는 옵션: " << a << "\n";
       usage(argv[0]);
@@ -136,12 +145,21 @@ bool parse_args(int argc, char** argv, Options& o) {
 
 // 울음 감지 스레드: 1초마다 최근 1.5초로 판정해 audio/cry를 발행한다.
 void cry_loop(const Options& o, MqttClient& mqtt) {
-#ifndef NUNI_WITH_TFLITE
+#if !defined(NUNI_WITH_TFLITE) && !defined(NUNI_WITH_ECOAI)
   (void)o;
   (void)mqtt;
-  std::cerr << "[cry] TFLite 없이 빌드됨 — 울음 감지 끔\n";
+  std::cerr << "[cry] ECO.AI·TFLite 없이 빌드됨 — 울음 감지 끔\n";
 #else
-  auto model = make_yamnet_tflite(o.model, o.threads);
+  std::unique_ptr<AudioModel> model;
+#ifdef NUNI_WITH_ECOAI
+  if (o.engine != "tflite") {
+    model = make_yamnet_ecoai(o.model, o.threads, o.ecoai_backend);
+    if (!model && o.engine == "auto") std::cerr << "[cry] ECO.AI를 쓸 수 없어 TFLite 직접으로 넘어갑니다\n";
+  }
+#endif
+#ifdef NUNI_WITH_TFLITE
+  if (!model && o.engine != "ecoai") model = make_yamnet_tflite(o.model, o.threads);
+#endif
   if (!model) {
     std::cerr << "[cry] YAMNet 모델을 쓸 수 없어 울음 감지를 끕니다 (" << o.model << ")\n";
     return;

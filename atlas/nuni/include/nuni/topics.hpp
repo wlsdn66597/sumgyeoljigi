@@ -14,6 +14,9 @@ inline constexpr const char* FUSION_STATE = "fusion/state";  // 융합 판단 �
 inline constexpr const char* ALERT = "fusion/alert";         // 경보 이벤트
 inline constexpr const char* CONTROL = "control/action";     // 선제 환경 제어 권고
 inline constexpr const char* VIBRATE = "control/vibrate";    // 진동 직접 요청(시험용, 파이 4 nunivibe)
+inline constexpr const char* CRY_EPISODE = "cry/episode";    // 울음 구간 시작·끝·버림(CryLog)
+inline constexpr const char* CRY_HINT = "cry/hint";          // 울음 1·2순위 힌트(cry_personal.hint와 같은 키 + id)
+inline constexpr const char* CRY_FEEDBACK = "cry/feedback";  // 부모 답·'안 그쳤어요'·수유 기록(대시보드 → 기록)
 
 // breathing_rate: 회/분, movement: 0~1, presence: 재실 여부
 inline Json radar_msg(double breathing_rate, double movement, bool presence, double ts) {

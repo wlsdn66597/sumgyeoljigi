@@ -32,8 +32,9 @@
 | `cry_model/infer.py`의 `Mic` | `RingBuffer` + `src/audio_pulse.cpp` | 기기에 libpulse-simple이 없어 libpulse 기본 API로 녹음 |
 | `bus.py`(MQTT) | `src/mqtt.cpp` | 의존성 없는 MQTT 3.1.1(QoS 0). 접속 확인 뒤 구독, 재접속 때 구독 복원 |
 | (새로 만듦) | `src/dbus_service.cpp` | sdbus-c++ 2.x, LG 샘플과 같은 방식 |
+| `cry_personal.py`(일부) | `src/cry_log.cpp` | 울음 구간 나누기(새로 만듦) · 답 쌓기(feedback · feedback_not · log_feed) · 맥락 × 이력 힌트 · 미리 낸 예측. 아래 '울음 기록' |
 
-옮기지 않은 것: 대시보드(`app.py` → Flutter, 담당 A), 기록·리포트(`recorder.py`, `cloud.py` 등), 울음 힌트(`cry_personal.py`, 2단계), SCD41 읽기(ESP32로 옮기거나 2단계).
+옮기지 않은 것: 기록·리포트(`recorder.py`, `cloud.py` 등), 울음 힌트의 소리 비교(`cry_personal.py`의 블록 특징 · 아기별 판별 분석 · 자가 검증), SCD41 읽기(ESP32로 옮기거나 2단계). 대시보드는 Flutter로 새로 만들었다(`atlas/dashboard`).
 
 ## 검증 결과 (개발 PC, 2026-10-19)
 
@@ -95,6 +96,7 @@ make -j
 | 넣을 곳 | 파일 | 어디서 |
 |---|---|---|
 | `files/model/` | `yamnet_emb.tflite`, `yamnet_class_map.csv` | `cry_model/export_yamnet_tflite.py` 결과 / TF models 저장소 |
+| `files/model/` | `cry_personal_ctx.json` | `cry_model/artifacts`(sim_personal.py ctx) — 울음 힌트의 맥락 모델. 없으면 맥락은 균등 |
 | `files/lib/` | `libtensorflowlite.so`, `libtensorflowlite_xnnpack_delegate.so` | SDK sysroot (`atlas/yamnet_test`에서 쓴 것) |
 | `files/mosquitto/` | `mosquitto`, `mosquitto.conf` | `deploy/build_mosquitto.sh` (기기에 브로커가 없음) |
 
@@ -110,7 +112,7 @@ busctl --system call com.atlas.PackageManager1 /com/atlas/PackageManager1 com.at
   Install ss com.atlas.NuniFusion1 /tmp/com.atlas.NuniFusion1.ipk
 SVC=/data/share/usr/atlas/services/com.atlas.NuniFusion1
 mkdir -p $SVC/systemd $SVC/mosquitto
-cp yamnet_emb.tflite setup_on_device.sh $SVC/
+cp yamnet_emb.tflite cry_personal_ctx.json setup_on_device.sh $SVC/   # 맥락 모델은 cry_model/artifacts
 cp deploy/nunifusion.service deploy/nuni-mosquitto.service $SVC/systemd/
 cp mosquitto mosquitto.conf $SVC/mosquitto/        # build_mosquitto.sh 결과
 # 설치만으로는 서비스가 안 뜬다. 샘플에서 겪은 함정 5가지를 이 스크립트가 처리한다
@@ -147,6 +149,11 @@ journalctl -u nunivibe -f
 | `NUNI_CRY_WAV` | (없음) | 마이크 대신 WAV를 반복 재생(시연·시험) |
 | `NUNI_FUSION_CRY_THRESHOLD` | 0.7 | 수면 상태의 울음 확정 임계(`sleep_state.py`와 같음) |
 | `NUNI_BR_MIN`, `NUNI_APNEA_HOLD_S` 등 | `radar_bridge.py`와 같음 | 레이더 게이팅 |
+| `NUNI_ENABLE_CRYLOG` | 1 | 울음 기록(답 쌓기 + 힌트) 켜고 끄기 |
+| `NUNI_CRY_DIR` | `/data/nuni/cry` | 울음 기록 폴더(패키지를 다시 깔아도 남는 곳) |
+| `NUNI_CRY_CTX` | 실행 파일 옆 `cry_personal_ctx.json` | 맥락 모델 |
+| `NUNI_CRY_RECORD` | 1 | 울음 소리(WAV)·임베딩 저장. 0이면 답만 |
+| `NUNI_CRY_END_GAP` / `NUNI_CRY_MIN_WINDOWS` | 8 / 3 | 울음이 끝났다고 볼 끊김(초) / 잡음으로 버릴 울음 1초 수 |
 
 명령줄로 덮어쓸 수 있다: `nunifusion --help`.
 
@@ -160,11 +167,59 @@ journalctl -u nunivibe -f
 | 신호 | `StateChanged` | s | `fusion/state` JSON(발행할 때마다) |
 | 신호 | `Alert` | s, s | 경보 수준, 이유 |
 | 신호 | `CryDetected` | d | 울음 점수(울음이 아님 → 울음으로 바뀔 때) |
+| 메서드 | `GetAlerts` | → s | 최근 경보 `[{"level","reason","ts"}]`(24시간, 최대 200개) |
+| 메서드 | `GetCryLog` | → s | 울음 기록 상태: 지금 울음(+힌트) · 답 기다리는 울음(`pending`) · 최근 울음 · 답 수 · 힌트가 맞은 수 · 마지막 수유 |
+| 메서드 | `AnswerCry` | s id, s action → s | "무엇으로 그쳤나요?" 답. action = feed · diaper · hold(학습) / self · sick · other · unknown(기록만) |
+| 메서드 | `AnswerCryNot` | s id, s action → s | "해 봤는데 안 그쳤어요"(feed · diaper · hold). 울음 중에도 누를 수 있다 |
+| 메서드 | `LogFeed` | → s | 지금 수유했다고 기록(맥락의 '마지막 수유 후 시간') |
+| 신호 | `CryEpisode` | s | 울음 기록 사건 `{"event": start · hint · end · drop · answer · not · feed, …}` |
+
+답 메서드는 `{"ok":true,"event":…}` 또는 `{"ok":false,"error":"…"}`(한국어 문구)를 돌려준다.
 
 ```bash
 busctl call com.atlas.NuniFusion1 /com/atlas/NuniFusion1 com.atlas.NuniFusion1 GetState
+busctl call com.atlas.NuniFusion1 /com/atlas/NuniFusion1 com.atlas.NuniFusion1 AnswerCry ss 20261020-023351 feed
 arc run -d rpi -s com.atlas.NuniFusion1 -p '[GetState]'
 ```
+
+앱(대시보드)은 `package-manager` 그룹으로 실행된다. 패키지 관리자가 설치 때 만드는 `/data/share/usr/share/dbus-1/system.d/com.atlas.NuniFusion1.conf`는
+마지막에 읽히면서 기본으로 모두 막는다. `setup_on_device.sh`가 `/etc`에 넣는 정책의 `<policy group="package-manager">`가 이를 연다
+(D-Bus는 group 정책을 default 정책보다 나중에 적용한다. 앱 UID는 설치마다 바뀌어 user로는 적을 수 없다). 2026-10-20 파이 5에서 확인.
+
+## 울음 기록 (CryLog, `src/cry_log.cpp`)
+
+부모가 "무엇으로 그쳤나요?"에 답할 때마다 그 울음과 함께 기기에 쌓고, 답이 10번 모이면 다음 울음부터 먼저 해 볼 1·2순위를 낸다.
+흐름과 이름은 `cry_personal.py`(CryPersonal)와 같다.
+
+1. **울음 구간 나누기**(새로 만듦): 1초 판정 점수가 0.3 이상이면 울음 1초. 울음이 시작되면 구간을 열고, 울음 판정이 8초 끊기면 닫는다.
+   울음 1초가 3개보다 적으면 잡음으로 버린다(`drop`). `NUNI_CRY_END_GAP`·`NUNI_CRY_MIN_WINDOWS`로 바꾼다.
+2. **힌트**: 울음이 시작되면 낸다. 맥락(시간대 · 직전 울음 후 시간 · 마지막 수유 후 시간, `cry_personal_ctx.json` 공통 로지스틱 회귀) ×
+   이 아기의 이전 답 빈도(최근 답일수록 크게, 답 8개마다 절반). 답이 10번 모이기 전에는 `show`·`show2`가 거짓(대시보드가 숨김).
+3. **답**: 학습하는 답(수유 · 기저귀 · 안아주기)만 이력에 들어가고, 저절로 · 아파 보임 · 기타 · 모름은 기록만 한다. 수유 답은 마지막 수유 시각도 바꾼다.
+   답을 받기 전에 '맥락 × 이력' 예측(`pred_base`)과 맥락 특징(`c`)을 남겨, 나중에 소리 모델의 자가 검증과 아기별 맥락 학습에 쓴다.
+4. **저장**: `/data/nuni/cry/cry_log.json`(답할 때마다 통째로 다시 씀) · `audio/<id>.wav`(울음 구간 16kHz, 시작 전 2초 포함, 최대 10분, 합계 2GB를
+   넘으면 오래된 것부터 지움) · `emb/<id>.f32`(울음 1초마다 YAMNet 임베딩 1024개). 소리는 기기 밖으로 나가지 않는다. `NUNI_CRY_RECORD=0`이면 답만 쌓는다.
+
+소리 비교(블록 특징 82개 + 아기별 판별 분석 + 자가 검증)는 아직 옮기지 않았다. 지금 힌트는 `cry_personal.py`에서 자가 검증이 소리를 끈 상태와
+같다. 실제 아기 기록(Enes) 재생에서도 자가 검증은 대부분 소리를 꺼 두었다. 쌓인 소리·임베딩으로, 소리 모델을 옮긴 뒤 지금까지의 답을 그대로
+다시 배울 수 있다.
+
+MQTT로도 내보낸다(다른 구독자·나중의 소리 모델용): `cry/episode`(start · end · drop), `cry/hint`(`cry_personal.hint`와 같은 키 + `id`),
+`cry/feedback`(answer · not · feed).
+
+**Python과 비교**: `tests/cry_log_parity.py`가 같은 사건 순서(울음 시작 · 1초 · 끝 · 답 · 안 그쳤어요 · 수유 · 힌트)를 `tools/cry_log_replay`와
+`CryPersonal`에 넣어 비교한다. 2026-10-20: 시드 5개 × 울음 150개, 힌트·예측 **1,605건 완전 일치**(힌트가 보이는 경우 포함). 맥락 특징은 현지
+시각을 쓰므로 두 쪽 시간대를 같게 둔다(`TZ=KST-9`).
+
+```bash
+python atlas/nuni/tests/cry_log_parity.py --replay "wsl -d Ubuntu-22.04 -u jinu -- env TZ=KST-9 /home/jinu/nuni_native/cry_log_replay" \
+  --replay-ctx /home/jinu/nuni_native/cry_personal_ctx.json
+```
+
+**기기 시험**(2026-10-20 파이 5): 서비스에 임시 설정(`/run/systemd/system/nunifusion.service.d/`, 재부팅하면 사라짐)으로 울음 녹음
+(ESC-50 아기 울음 15초 + 정적 14초 반복)과 시험 폴더를 주고, 울음 시작 → 끝 → `AnswerCry(feed)` → 다음 울음 중 `AnswerCryNot(diaper)`를 확인했다.
+수유 답 뒤 다음 울음의 1순위가 수유에서 안아주기로 바뀌었다(방금 수유한 맥락). 휴대폰 녹음 칭얼거림(donateacry)은 YAMNet 울음 점수가 낮아
+(대부분 0.1 미만) 잡음으로 버려졌다.
 
 ## 진동 노드 `nunivibe` (파이 4)
 
@@ -209,6 +264,7 @@ atlas/nuni/
   files/                serviceinfo.json, .apptype, D-Bus 정책·활성화 파일(LG 샘플과 같은 자리)
   deploy/               systemd 유닛, 기기 마무리 스크립트, 브로커 빌드 스크립트·설정
   tools/nuni_replay.cpp 비교 시험용 재생 도구
-  tests/                시나리오 생성, Python 재생, 비교, MQTT 통합 시험
+  tools/cry_log_replay.cpp 울음 기록 재생(tests/cry_log_parity.py가 cry_personal.py와 비교)
+  tests/                시나리오 생성, Python 재생, 비교, MQTT 통합 시험, 울음 기록 비교
   third_party/nlohmann/ JSON 헤더(MIT, v3.11.3)
 ```

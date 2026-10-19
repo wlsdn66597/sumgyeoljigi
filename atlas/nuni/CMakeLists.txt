@@ -36,6 +36,7 @@ add_library(nuni_core STATIC
   src/fusion.cpp
   src/radar_bridge.cpp
   src/cry_detector.cpp
+  src/cry_log.cpp
   src/mqtt.cpp
   src/audio_wav.cpp
 )
@@ -137,6 +138,9 @@ if(HAVE_SDBUS)
 endif()
 
 # ── 시험 도구(Python 원본과 출력 비교) ───────────────────────────────────────
+add_executable(cry_log_replay tools/cry_log_replay.cpp)
+target_link_libraries(cry_log_replay PRIVATE nuni_core)
+
 add_executable(nuni_replay tools/nuni_replay.cpp)
 target_link_libraries(nuni_replay PRIVATE nuni_core)
 if(HAVE_TFLITE)

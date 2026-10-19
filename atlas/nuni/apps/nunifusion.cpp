@@ -5,7 +5,10 @@
 //   cry    : 마이크(PulseAudio) → YAMNet(ECO.AI, 없으면 TFLite) → audio/cry 1초마다 발행  (cry_classifier.py 실물 경로)
 //   fusion : sensor/radar · audio/cry · sensor/env 구독 → fusion/state · fusion/alert · control/action 발행
 //            (fusion.py + sleep_state.py + env_control.py + personalization.py)
+//   crylog : 울음 구간을 나누고 부모 답("무엇으로 그쳤나요?")을 쌓아 1·2순위 힌트를 낸다(cry_personal.py 흐름).
+//            cry/episode · cry/hint · cry/feedback 발행, 기록은 /data/nuni/cry
 //   + D-Bus: com.atlas.NuniFusion1 이름을 가져가 서비스 매니저에 RUNNING으로 보이고, 상태를 메서드·신호로 내보낸다.
+//            대시보드는 여기서 울음 기록을 읽고 답을 보낸다(AnswerCry 등).
 //
 // 설정은 환경변수(systemd 유닛의 Environment=)로 하고, 시험할 때는 명령줄 옵션으로 덮어쓴다. --help 참고.
 #include <signal.h>
@@ -15,13 +18,17 @@
 #include <chrono>
 #include <cstdlib>
 #include <cstring>
+#include <deque>
+#include <functional>
 #include <iostream>
 #include <memory>
+#include <mutex>
 #include <string>
 #include <thread>
 
 #include "nuni/audio_source.hpp"
 #include "nuni/cry_detector.hpp"
+#include "nuni/cry_log.hpp"
 #include "nuni/fusion.hpp"
 #include "nuni/json_util.hpp"
 #include "nuni/mqtt.hpp"
@@ -95,6 +102,13 @@ struct Options {
   int mic_sr = static_cast<int>(env_num("NUNI_MIC_SR", 48000));  // USB 마이크 고유 레이트(cry_classifier.py)
   std::string pulse_server = env_str("NUNI_PULSE_SERVER"), pulse_source = env_str("NUNI_PULSE_SOURCE");
   std::string wav = env_str("NUNI_CRY_WAV");  // 지정하면 마이크 대신 이 파일을 반복 재생
+  // 울음 기록(부모 답 쌓기 + 힌트). 기록 폴더는 패키지를 다시 깔아도 남는 /data 아래에 둔다
+  bool crylog = env_on("NUNI_ENABLE_CRYLOG", true);
+  std::string cry_dir = env_str("NUNI_CRY_DIR", "/data/nuni/cry");
+  std::string cry_ctx = env_str("NUNI_CRY_CTX", exe_dir() + "/cry_personal_ctx.json");
+  bool cry_record = env_on("NUNI_CRY_RECORD", true);  // 울음 소리·임베딩 저장(기기 안에만)
+  double cry_end_gap = env_num("NUNI_CRY_END_GAP", 8);
+  int cry_min_windows = static_cast<int>(env_num("NUNI_CRY_MIN_WINDOWS", 3));
 };
 
 void usage(const char* argv0) {
@@ -109,6 +123,8 @@ void usage(const char* argv0) {
             << "  --engine E              추론 엔진 auto|ecoai|tflite (NUNI_YAMNET_ENGINE; 기본 auto = ECO.AI → TFLite)\n"
             << "그 밖의 환경변수: NUNI_ECOAI_BACKEND(cpu|gpu), NUNI_CRY_THRESHOLD, NUNI_YAMNET_THREADS,\n"
             << "  NUNI_PULSE_SERVER, NUNI_PULSE_SOURCE,\n"
+            << "  울음 기록: NUNI_ENABLE_CRYLOG(1), NUNI_CRY_DIR(/data/nuni/cry), NUNI_CRY_CTX, NUNI_CRY_RECORD(1),\n"
+            << "  NUNI_CRY_END_GAP(8초), NUNI_CRY_MIN_WINDOWS(3),\n"
             << "  NUNI_FUSION_CRY_THRESHOLD, 레이더 게이팅 값(NUNI_BR_MIN 등, radar_bridge.py와 같음)\n";
 }
 
@@ -143,11 +159,16 @@ bool parse_args(int argc, char** argv, Options& o) {
   return true;
 }
 
+using CryEventFn = std::function<void(const CryLog::Event&)>;
+
 // 울음 감지 스레드: 1초마다 최근 1.5초로 판정해 audio/cry를 발행한다.
-void cry_loop(const Options& o, MqttClient& mqtt) {
+// 울음 기록이 켜져 있으면 그 1초의 점수·임베딩·소리(지난 1초, 16kHz)를 넘겨 울음 구간을 나눈다.
+void cry_loop(const Options& o, MqttClient& mqtt, CryLog* cry_log, const CryEventFn& on_cry_event) {
 #if !defined(NUNI_WITH_TFLITE) && !defined(NUNI_WITH_ECOAI)
   (void)o;
   (void)mqtt;
+  (void)cry_log;
+  (void)on_cry_event;
   std::cerr << "[cry] ECO.AI·TFLite 없이 빌드됨 — 울음 감지 끔\n";
 #else
   std::unique_ptr<AudioModel> model;
@@ -189,9 +210,15 @@ void cry_loop(const Options& o, MqttClient& mqtt) {
       continue;
     }
     const auto t0 = std::chrono::steady_clock::now();
-    auto msg = det.classify(ring.last(1.5), o.mic_sr, o.cry_threshold, wall_now());
+    const double ts = wall_now();
+    CryResult detail;
+    auto msg = det.classify(ring.last(1.5), o.mic_sr, o.cry_threshold, ts, &detail);
     if (!msg) continue;
     mqtt.publish(topics::CRY, dump(*msg));
+    if (cry_log) {
+      const auto sec = resample_linear(ring.last(1.0), o.mic_sr);  // 겹치지 않는 지난 1초(녹음용)
+      for (const auto& ev : cry_log->tick(ts, detail.cry_score, detail.embedding, sec)) on_cry_event(ev);
+    }
     if (++n == 1 || n % 600 == 0) {
       const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
       std::cerr << "[cry] " << n << "번째 판정 " << ms << "ms, 점수 " << (*msg)["confidence"] << "\n";
@@ -215,13 +242,70 @@ int main(int argc, char** argv) {
   std::cerr << "[nuni] 시작: radar " << o.radar << ", cry " << o.cry << ", fusion " << o.fusion << ", MQTT " << o.host
             << ":" << o.port << "\n";
 
-#ifdef NUNI_WITH_DBUS
-  std::unique_ptr<DbusService> dbus;
-  if (o.dbus) dbus = make_dbus_service(!o.dbus_session);
-#endif
-
   MqttClient mqtt(o.host, o.port, "nunifusion-" + std::to_string(getpid()));
   if (!o.user.empty()) mqtt.set_credentials(o.user, o.pass);
+
+  // 울음 기록(부모 답 쌓기 + 1·2순위 힌트)
+  std::unique_ptr<CryLog> cry_log;
+  if (o.cry && o.crylog) {
+    CryLogConfig cc;
+    cc.dir = o.cry_dir;
+    cc.ctx_path = o.cry_ctx;
+    cc.record = o.cry_record;
+    cc.min_score = o.cry_threshold;
+    cc.end_gap_s = o.cry_end_gap;
+    cc.min_windows = o.cry_min_windows;
+    cry_log = std::make_unique<CryLog>(cc);
+  }
+
+  // 최근 경보(대시보드의 '오늘 밤' 줄에 쓴다)
+  std::mutex alerts_mu;
+  std::deque<Json> alerts;
+
+  DbusService* dbus_ptr = nullptr;  // 아래에서 만든 뒤 채운다(울음 사건 신호용)
+  const CryEventFn on_cry_event = [&](const CryLog::Event& ev) {
+    const char* topic = topics::CRY_EPISODE;  // start · end · drop
+    if (ev.kind == "hint") topic = topics::CRY_HINT;
+    else if (ev.kind == "answer" || ev.kind == "not" || ev.kind == "feed") topic = topics::CRY_FEEDBACK;
+    mqtt.publish(topic, dump(ev.data));
+    if (dbus_ptr) dbus_ptr->emit_cry_event(ev.data);
+    if (ev.kind == "start" || ev.kind == "end" || ev.kind == "answer")
+      std::cerr << "[crylog] " << ev.kind << " " << ev.data.value("id", "") << "\n";
+  };
+
+#ifdef NUNI_WITH_DBUS
+  std::unique_ptr<DbusService> dbus;
+  if (o.dbus) {
+    DbusHandlers h;
+    h.get_alerts = [&] {
+      std::lock_guard<std::mutex> lk(alerts_mu);
+      Json a = Json::array();
+      for (const auto& x : alerts) a.push_back(x);
+      return dump(a);
+    };
+    if (cry_log) {
+      auto result = [&](const std::optional<CryLog::Event>& ev, const std::string& err) {
+        if (!ev) return dump(Json{{"ok", false}, {"error", err}});
+        on_cry_event(*ev);
+        return dump(Json{{"ok", true}, {"event", ev->data}});
+      };
+      h.get_cry_log = [&] { return dump(cry_log->snapshot(wall_now())); };
+      h.answer_cry = [&, result](const std::string& id, const std::string& action) {
+        std::string err;
+        auto ev = cry_log->feedback(id, action, wall_now(), &err);
+        return result(ev, err);
+      };
+      h.answer_cry_not = [&, result](const std::string& id, const std::string& action) {
+        std::string err;
+        auto ev = cry_log->feedback_not(id, action, wall_now(), &err);
+        return result(ev, err);
+      };
+      h.log_feed = [&, result] { return result(cry_log->log_feed(wall_now()), ""); };
+    }
+    dbus = make_dbus_service(!o.dbus_session, std::move(h));
+    dbus_ptr = dbus.get();
+  }
+#endif
 
   long n_radar_out = 0, n_state = 0, n_in = 0;
   bool last_crying = false;
@@ -229,6 +313,13 @@ int main(int argc, char** argv) {
   // fusion이 발행하는 메시지 → MQTT(+ D-Bus 신호)
   Fusion fusion([&](const std::string& topic, const Json& payload) {
     mqtt.publish(topic, dump(payload));
+    if (topic == topics::ALERT) {
+      std::lock_guard<std::mutex> lk(alerts_mu);
+      alerts.push_back(payload);
+      const double cutoff = wall_now() - 24 * 3600;
+      while (!alerts.empty() && (alerts.size() > 200 || num_or(pyget(alerts.front(), "ts", 0), 0) < cutoff))
+        alerts.pop_front();
+    }
 #ifdef NUNI_WITH_DBUS
     if (dbus) {
       if (topic == topics::FUSION_STATE) dbus->emit_state(payload);
@@ -272,7 +363,7 @@ int main(int argc, char** argv) {
   });
 
   std::thread cry_th;
-  if (o.cry) cry_th = std::thread([&] { cry_loop(o, mqtt); });
+  if (o.cry) cry_th = std::thread([&] { cry_loop(o, mqtt, cry_log.get(), on_cry_event); });
 
   using clock = std::chrono::steady_clock;
   auto next_tick = clock::now() + std::chrono::seconds(1);

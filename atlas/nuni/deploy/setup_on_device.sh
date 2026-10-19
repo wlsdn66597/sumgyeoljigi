@@ -34,6 +34,14 @@ cat > /etc/dbus-1/system.d/$ID.conf <<EOF
     <allow send_destination="$ID"/>
     <allow receive_sender="$ID"/>
   </policy>
+  <!-- 내려받아 설치한 앱(대시보드 등)은 package-manager 그룹(1011)으로 실행된다(2026-10-20 Pi 5 확인).
+       패키지 관리자가 설치 때 만드는 /data/share/usr/share/dbus-1/system.d/$ID.conf는 마지막에 읽히고
+       기본(default)으로 모두 막는다. D-Bus는 group 정책을 default 정책보다 나중에 적용하므로, 여기서 허용해야
+       앱이 메서드를 부르고 신호를 받을 수 있다(앱 UID는 설치마다 바뀌어 user로 적을 수 없다). -->
+  <policy group="package-manager">
+    <allow send_destination="$ID"/>
+    <allow receive_sender="$ID"/>
+  </policy>
 </busconfig>
 EOF
 

@@ -805,6 +805,7 @@ MFCC를 계산하는 프레임 세기에서 리듬 8개를 뽑았다. 소리 나
 - 블록이 많아지면 아기별 판별 분석이 처음으로 proto를 이긴다(1순위 0.603 → 0.612). 블록 6개(232차원) 중 그 아기에게 중요한 방향을 고르는 효과다.
 - 혼합 세계(가장 현실적인 가정)에서도 0.58 → 0.61로 오른다.
 - **기본값 변경**: 블록 = 쓸 수 있는 것 전부(YAMNet16 · 음향 변환 · MFCC · 리듬 · 목소리 · 스펙트럼), `sound_method="lda"`. 예전 시험 스크립트는 `sound_method="proto"`로 고정해 재현성을 지켰다. 변환 파일에 voice·spectral 표준화와 퍼짐을 더해야 새 블록이 켜진다(`sim_kclass.py feats` → `export`).
+- 변환 파일은 서버 없이 노트북에서도 만들 수 있다. `feats`가 울음별 YAMNet 임베딩을 함께 저장해서, `export`가 서버의 중간 파일(prep.npz) 없이 동작한다. CPU 1작업자로 12분 걸렸고, 블록 퍼짐 값은 서버 결과와 같았다.
 
 결과: DATA_ROOT/runs/synthetic/KCLASS_VOICE_REPORT.md
 

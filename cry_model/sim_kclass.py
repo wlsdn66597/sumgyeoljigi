@@ -96,17 +96,19 @@ def _feat_one(job):
     x = sa.load_clip(paths)
     xw = np.pad(x, (0, max(0, sa.WIN - len(x))))
     wins = [xw[s:s + sa.WIN] for s in range(0, len(xw) - sa.WIN + 1, sa.HOP)]
-    cry = []
+    cry, embs = [], []
     for w in wins:
         _W["yam"].it.set_tensor(_W["yam"].inp, w.astype(np.float32))
         _W["yam"].it.invoke()
         sc = _W["yam"].it.get_tensor(_W["yam"].out[521]).reshape(-1)
+        embs.append(_W["yam"].it.get_tensor(_W["yam"].out[1024]).reshape(-1).copy())
         cry.append(max(sc[19], sc[20]) >= sa.CRY_THR)
     use = [w for w, c in zip(wins, cry) if c] or wins
+    emb = np.mean([e for e, c in zip(embs, cry) if c] or embs, 0)          # sim_augment.Yam.clip과 같은 울음 창 평균
     fr = [cp.frame_features(w, _W["fb"]) for w in use]
     ms = cp.audio_stats(*(np.concatenate([f[j] for f in fr]) for j in range(5)))   # MFCC 40 + 리듬 8 + 목소리 14 + 스펙트럼 20
     xs = np.pad(x, (0, max(0, sa.SR - len(x))))
-    return k, ms.astype(np.float32), spectral_shape(xs).astype(np.float32)
+    return k, ms.astype(np.float32), spectral_shape(xs).astype(np.float32), emb.astype(np.float32)
 
 
 def rhythm(m):
@@ -127,16 +129,18 @@ def cmd_feats(a):
     m = sa.items()
     MS = np.zeros((len(m), 82), np.float32)
     SP = np.zeros((len(m), 22), np.float32)
+    EM = np.zeros((len(m), 1024), np.float32)
     t0 = time.time()
     with Pool(a.workers, initializer=_init_feats) as pool:
-        for n, (k, ms, sp) in enumerate(pool.imap_unordered(_feat_one, list(enumerate(m.paths)), chunksize=4)):
-            MS[k], SP[k] = ms, sp
-            if (n + 1) % 500 == 0:
+        for n, (k, ms, sp, em) in enumerate(pool.imap_unordered(_feat_one, list(enumerate(m.paths)), chunksize=4)):
+            MS[k], SP[k], EM[k] = ms, sp, em
+            if (n + 1) % a.every == 0:
                 print(f"  {n + 1}/{len(m)} {time.time() - t0:.0f}s", flush=True)
-    m2 = pd.read_csv(os.path.join(sa.OUT, "items.csv"))
+    os.makedirs(sa.OUT, exist_ok=True)
+    m.drop(columns="paths").to_csv(os.path.join(sa.OUT, "items.csv"), index=False)
     MS = np.nan_to_num(MS)
     np.savez(FEATS2, mfcc_dev=MS[:, :40], rhythm_dev=MS[:, 40:48], audio_dev=MS, spec=np.nan_to_num(SP),
-             rhythm=rhythm(m2))
+             rhythm=rhythm(m), emb=EM)
     print(f"저장 {FEATS2} {time.time() - t0:.0f}s", flush=True)
 
 
@@ -153,8 +157,13 @@ def enes_order(m, min_n=15):
 def cmd_export(_):
     """MFCC 멜 필터(librosa와 같은 값)·공개 데이터 기준 표준화, 그리고 블록마다 'Enes 아기 안 퍼짐'(라벨 안 씀)을 더한다."""
     import librosa
-    m, A, E, G, O, VAR, MODES, view = sa.load_all()
     f = np.load(FEATS2)
+    if os.path.exists(os.path.join(sa.OUT, "prep.npz")):
+        m, A, E, G, O, VAR, MODES, view = sa.load_all()
+    else:                                                     # 서버 중간 파일 없이(노트북): feats의 울음 임베딩을 쓴다
+        m = pd.read_csv(os.path.join(sa.OUT, "items.csv"))
+        m["baby"] = m.baby.fillna("").astype(str)
+        E = f["emb"].astype(float)[:, None, :]
     z = dict(np.load(ACOUSTIC_NPZ))
     pub = (m.source != "enes").values
     MS = f["audio_dev"].astype(float)
@@ -720,6 +729,7 @@ def main():
     sp = ap.add_subparsers(dest="cmd", required=True)
     p = sp.add_parser("feats")
     p.add_argument("--workers", type=int, default=4)
+    p.add_argument("--every", type=int, default=500, help="진행 표시 간격")
     sp.add_parser("export")
     p = sp.add_parser("run")
     p.add_argument("--workers", type=int, default=4)

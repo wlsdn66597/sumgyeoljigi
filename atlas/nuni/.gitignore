@@ -1,0 +1,5 @@
+# 기기에 같이 넣지만 저장소에는 올리지 않는 큰 파일(README '기기에 같이 넣을 파일')
+files/model/
+files/lib/
+files/mosquitto/
+build/

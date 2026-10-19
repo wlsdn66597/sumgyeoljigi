@@ -1,0 +1,23 @@
+# atlas 기기용 systemd 유닛 — D-Bus 직접 활성화는 보안 레이블에 막히므로 systemd를 거쳐 띄운다
+# (2026-09-19 샘플 lifecycleservice에서 확인한 방식. 플랫폼 정상 서비스들도 모두 SystemdService= 위임).
+[Unit]
+Description=Nuni fusion service (radar + cry + environment, com.atlas.NuniFusion1)
+After=network-online.target nuni-mosquitto.service pulseaudio.service
+Wants=network-online.target nuni-mosquitto.service
+
+[Service]
+Type=dbus
+BusName=com.atlas.NuniFusion1
+WorkingDirectory=/data/share/usr/atlas/services/com.atlas.NuniFusion1
+ExecStart=/data/share/usr/atlas/services/com.atlas.NuniFusion1/nunifusion
+# 설정(필요한 것만 바꾼다). 전체 목록: nunifusion --help
+Environment=NUNI_MQTT_HOST=localhost
+Environment=NUNI_MIC_SR=48000
+Environment=NUNI_YAMNET_THREADS=2
+# Environment=NUNI_PULSE_SERVER=unix:/var/run/pulse/native
+# Environment=NUNI_PULSE_SOURCE=<pactl list short sources 로 확인한 이름>
+Restart=on-failure
+RestartSec=3
+
+[Install]
+WantedBy=multi-user.target

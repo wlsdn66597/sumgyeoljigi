@@ -10,3 +10,7 @@
 빌드(개발 컨테이너 안): `cd yamnet_test && mkdir build && cd build && cmake .. && make`
 기기 실행: 실행 파일·`yamnet_emb.tflite`·`lib/`(libtensorflowlite.so, libtensorflowlite_xnnpack_delegate.so, libecoai-inference.so.1, libglog.so.1 — 기기에 없음)를 `/mnt/rawdata/nuni`에 두고
 `LD_LIBRARY_PATH=$PWD/lib ./yamnet_tflite_test yamnet_emb.tflite [input_15600.f32]`. 시스템 경로는 건드리지 않는다.
+
+## nuni — 숨결지기 서비스 C++ 이식 (2026-10-19)
+
+`nuni/`는 파이에서 Python으로 돌던 실시간 경로(레이더 변환·울음 감지·융합 판단)를 C++ 네이티브 서비스 `com.atlas.NuniFusion1`로 옮긴 것이다. 울음 감지는 위 `yamnet_tflite_test`와 같은 방식(TFLite 직접 사용, XNNPACK)이다. 같은 입력을 넣었을 때 Python 원본과 출력이 완전히 같은지 비교 시험을 붙여 두었다. 빌드·배포·검증 결과는 [nuni/README.md](nuni/README.md)에 있다.

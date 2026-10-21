@@ -15,13 +15,19 @@ from personalization import Personalizer
 
 _ORDER = {"normal": 0, "attention": 1, "alert": 2}
 
+# ToF(sensor/tof): 침대 난간 높이에서 수평으로 보는 거리 센서. 빔에 무언가 걸리면 아기가 일어선 것으로 본다.
+STAND_MIN_S = 2.0     # 이만큼 계속 감지돼야 '일어섬'(손·장난감이 잠깐 스치는 것은 무시)
+STAND_LONG_S = 30.0   # 이만큼 계속 서 있으면 경보(난간을 넘을 수 있음)
+TOF_STALE_S = 5.0     # ToF 메시지가 이만큼 안 오면 감지 없음으로 본다(센서 끊김)
+
 
 def _max(a, b):
     return a if _ORDER[a] >= _ORDER[b] else b
 
 
-def decide(radar, cry, env):
-    """(level, reasons) 반환. level: normal/attention/alert"""
+def decide(radar, cry, env, stand_s=None):
+    """(level, reasons) 반환. level: normal/attention/alert
+    stand_s: ToF가 계속 감지한 시간(초). None이면 감지 없음(Fusion이 계산해 넘긴다)."""
     level, reasons = "normal", []
 
     apnea = bool(radar and radar.get("apnea"))
@@ -54,6 +60,17 @@ def decide(radar, cry, env):
     if irregular and (cry_flag or bad_env):
         level = _max(level, "alert")
         reasons.append("경계 호흡+보강신호 교차검증")
+
+    # 일어섬(ToF): 혼자도 주의, 울음과 겹치거나 오래 서 있으면 경보
+    if stand_s is not None and stand_s >= STAND_MIN_S:
+        level = _max(level, "attention")
+        reasons.append("아기 일어섬(난간 높이 감지)")
+        if cry_flag:
+            level = _max(level, "alert")
+            reasons.append("일어서서 울음")
+        if stand_s >= STAND_LONG_S:
+            level = _max(level, "alert")
+            reasons.append("오래 서 있음(낙상 주의)")
 
     if env:
         if env.get("co2", 0) > 1000:
@@ -88,7 +105,9 @@ class Fusion:
     """
 
     def __init__(self, debounce_n=2, cooldown_s=10, now_fn=time.time):
-        self.radar = self.cry = self.env = None
+        self.radar = self.cry = self.env = self.tof = None
+        self._tof_rx = None        # 마지막 ToF 메시지를 받은 시각
+        self._stand_since = None   # ToF 감지가 이어지기 시작한 시각
         self.last = "normal"
         self.debounce_n = debounce_n
         self.cooldown_s = cooldown_s
@@ -120,15 +139,30 @@ class Fusion:
         self._last_alert_ts = now
         return True
 
+    def _stand_seconds(self):
+        """ToF 감지가 이어진 시간(초). 감지가 없거나 ToF가 끊겼으면 None."""
+        now = self._now()
+        fresh = self._tof_rx is not None and now - self._tof_rx <= TOF_STALE_S
+        if fresh and self.tof and self.tof.get("detected"):
+            if self._stand_since is None:
+                self._stand_since = now
+            return now - self._stand_since
+        self._stand_since = None
+        return None
+
     def _process(self):
         """현재 신호로 판단·발행. (level, reasons, alert_emitted) 반환."""
-        raw_level, reasons = decide(self.radar, self.cry, self.env)
+        stand_s = self._stand_seconds()
+        standing = stand_s is not None and stand_s >= STAND_MIN_S
+        raw_level, reasons = decide(self.radar, self.cry, self.env, stand_s)
         level = self._debounce(raw_level)
         out_reasons = reasons if level != "normal" else []
         store.set_fusion(level, out_reasons)
 
         # --- 일상 모니터링(헤드라인): 수면상태 · 개인화 · 선제 환경제어 ---
         ss, ss_reason = sleep_state.classify(self.radar, self.cry)
+        if standing:
+            ss, ss_reason = "awake", "일어섬 감지"
         store.set_sleep_state(ss, ss_reason)
         personal = {}
         if self.radar:
@@ -148,6 +182,7 @@ class Fusion:
             "sleep": {"state": ss, "reason": ss_reason},
             "personal": personal,
             "actions": [[a, r] for a, r in actions],
+            "standing": standing,
             "ts": topics.now(),
         })
 
@@ -166,14 +201,20 @@ class Fusion:
             self.cry = payload
         elif topic == topics.ENV:
             self.env = payload
+        elif topic == topics.TOF:
+            self.tof = payload
+            self._tof_rx = self._now()
         return self._process()
 
-    def update(self, radar=None, cry=None, env=None):
-        """한 틱에 세 모달을 한꺼번에 갱신하고 1회 판단 (시계열 평가용)."""
+    def update(self, radar=None, cry=None, env=None, tof=None):
+        """한 틱에 모달들을 한꺼번에 갱신하고 1회 판단 (시계열 평가용)."""
         if radar is not None:
             self.radar = radar
         if cry is not None:
             self.cry = cry
         if env is not None:
             self.env = env
+        if tof is not None:
+            self.tof = tof
+            self._tof_rx = self._now()
         return self._process()

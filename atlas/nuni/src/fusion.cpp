@@ -27,7 +27,7 @@ std::string join(const std::vector<std::string>& v, const char* sep) {
 
 }  // namespace
 
-Decision decide(const Json& radar, const Json& cry, const Json& env) {
+Decision decide(const Json& radar, const Json& cry, const Json& env, std::optional<double> stand_s) {
   std::string level = "normal";
   std::vector<std::string> reasons;
   const bool has_radar = truthy(radar);
@@ -65,6 +65,20 @@ Decision decide(const Json& radar, const Json& cry, const Json& env) {
   if (irregular && (cry_flag || bad_env)) {
     level = max_level(level, "alert");
     reasons.emplace_back("경계 호흡+보강신호 교차검증");
+  }
+
+  // 일어섬(ToF): 혼자도 주의, 울음과 겹치거나 오래 서 있으면 경보
+  if (stand_s && *stand_s >= STAND_MIN_S) {
+    level = max_level(level, "attention");
+    reasons.emplace_back("아기 일어섬(난간 높이 감지)");
+    if (cry_flag) {
+      level = max_level(level, "alert");
+      reasons.emplace_back("일어서서 울음");
+    }
+    if (*stand_s >= STAND_LONG_S) {
+      level = max_level(level, "alert");
+      reasons.emplace_back("오래 서 있음(낙상 주의)");
+    }
   }
 
   if (has_env) {
@@ -117,13 +131,27 @@ bool Fusion::cooldown_allows(const std::string& level, const std::vector<std::st
   return true;
 }
 
+std::optional<double> Fusion::stand_seconds() {
+  const double now = now_();
+  const bool fresh = tof_rx_ && now - *tof_rx_ <= TOF_STALE_S;
+  if (fresh && truthy(tof_) && truthy(pyget(tof_, "detected"))) {
+    if (!stand_since_) stand_since_ = now;
+    return now - *stand_since_;
+  }
+  stand_since_.reset();
+  return std::nullopt;
+}
+
 Fusion::Result Fusion::process() {
-  const Decision d = decide(radar_, cry_, env_);
+  const auto stand_s = stand_seconds();
+  const bool standing = stand_s && *stand_s >= STAND_MIN_S;
+  const Decision d = decide(radar_, cry_, env_, stand_s);
   const std::string level = debounce(d.level);
   const std::vector<std::string> out_reasons = level != "normal" ? d.reasons : std::vector<std::string>{};
 
   // 일상 모니터링(헤드라인): 수면상태 · 개인화 · 선제 환경제어
-  const auto ss = sleep_state::classify(radar_, cry_);
+  auto ss = sleep_state::classify(radar_, cry_);
+  if (standing) ss = {"awake", "일어섬 감지"};
   Json personal = Json::object();
   if (truthy(radar_)) {
     personalizer_.update(as_number(pyget(radar_, "breathing_rate", 0)), as_number(pyget(radar_, "movement", 0.0)));
@@ -146,6 +174,7 @@ Fusion::Result Fusion::process() {
   state["sleep"] = Json{{"state", ss.state}, {"reason", ss.reason}};
   state["personal"] = personal;
   state["actions"] = acts;
+  state["standing"] = standing;
   state["ts"] = now_();
   last_state_ = state;
   publish_(topics::FUSION_STATE, state);
@@ -163,13 +192,21 @@ Fusion::Result Fusion::on_message(const std::string& topic, const Json& payload)
   if (topic == topics::RADAR) radar_ = payload;
   else if (topic == topics::CRY) cry_ = payload;
   else if (topic == topics::ENV) env_ = payload;
+  else if (topic == topics::TOF) {
+    tof_ = payload;
+    tof_rx_ = now_();
+  }
   return process();
 }
 
-Fusion::Result Fusion::update(const Json& radar, const Json& cry, const Json& env) {
+Fusion::Result Fusion::update(const Json& radar, const Json& cry, const Json& env, const Json& tof) {
   if (!radar.is_null()) radar_ = radar;
   if (!cry.is_null()) cry_ = cry;
   if (!env.is_null()) env_ = env;
+  if (!tof.is_null()) {
+    tof_ = tof;
+    tof_rx_ = now_();
+  }
   return process();
 }
 

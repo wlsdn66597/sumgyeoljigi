@@ -8,6 +8,7 @@ namespace nuni::topics {
 
 inline constexpr const char* RADAR = "sensor/radar";         // 60GHz 레이더 (호흡·움직임·재실)
 inline constexpr const char* ENV = "sensor/env";             // 환경 센서 (온습도·CO2·조도)
+inline constexpr const char* TOF = "sensor/tof";             // ToF 거리 센서(VL53L1X, ESP32) — 침대 난간 높이에서 수평
 inline constexpr const char* CRY = "audio/cry";              // 울음 감지 결과
 inline constexpr const char* VOICE = "audio/voice";          // 부모 음성 인텐트
 inline constexpr const char* FUSION_STATE = "fusion/state";  // 융합 판단 현재 상태
@@ -30,6 +31,11 @@ inline Json env_msg(double temp, double humidity, int co2, double lux, double ts
 // cls: hungry/sleepy/discomfort/none, confidence: 0~1
 inline Json cry_msg(bool is_crying, const std::string& cls, double confidence, double ts) {
   return Json{{"is_crying", is_crying}, {"cls", cls}, {"confidence", confidence}, {"ts", ts}};
+}
+
+// distance_mm: 측정 거리, detected: 난간 높이 빔에 무언가 있음(아기가 일어섬). 판단은 ESP32가 한다.
+inline Json tof_msg(int distance_mm, bool detected, double ts) {
+  return Json{{"distance_mm", distance_mm}, {"detected", detected}, {"ts", ts}};
 }
 
 inline Json voice_msg(const std::string& intent, double ts) { return Json{{"intent", intent}, {"ts", ts}}; }

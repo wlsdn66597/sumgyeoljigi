@@ -6,7 +6,7 @@
 //   이름/경로/인터페이스: com.atlas.NuniFusion1  /com/atlas/NuniFusion1  com.atlas.NuniFusion1
 //   메서드  Ping() → s               "pong:<가동 초>"
 //           GetState() → s           마지막 fusion/state JSON
-//           GetSensors() → s         {"radar":…, "cry":…, "env":…} 마지막으로 받은 센서 메시지
+//           GetSensors() → s         {"radar":…, "cry":…, "env":…, "tof":…} 마지막으로 받은 센서 메시지
 //           GetAlerts() → s          최근 경보 [{"level","reason","ts"}, …] (24시간, 최대 200개)
 //           GetCryLog() → s          울음 기록 상태(CryLog::snapshot — 지금 울음·힌트·답 없는 울음·최근 울음들)
 //           AnswerCry(s id, s action) → s     "무엇으로 그쳤나요?" 답 → {"ok":true,…} 또는 {"ok":false,"error":…}
@@ -33,7 +33,7 @@ class DbusService {
   virtual void emit_alert(const std::string& level, const std::string& reason) = 0;
   virtual void emit_cry(double score) = 0;
   virtual void emit_cry_event(const Json& event) = 0;
-  virtual void set_sensor(const std::string& key, const Json& msg) = 0;  // key: radar / cry / env
+  virtual void set_sensor(const std::string& key, const Json& msg) = 0;  // key: radar / cry / env / tof
 };
 
 // 메서드가 부르는 처리 함수(비어 있으면 그 메서드는 {"ok":false} / 빈 값을 돌려준다). D-Bus 스레드에서 불린다.

@@ -6,7 +6,7 @@
 // 명령(op)
 //   fusion_new {debounce_n, cooldown_s}       새 Fusion(가짜 시계)
 //   fusion {t, topic, payload}                메시지 하나 → 발행된 메시지들 + 결과
-//   fusion_update {t, radar, cry, env}        세 모달 한꺼번에 갱신
+//   fusion_update {t, radar, cry, env, tof}   모달 한꺼번에 갱신
 //   decide / single {radar, cry, env}         판단 규칙만
 //   sleep {radar, cry}                        수면 상태
 //   env {env, ss}                             환경 권고
@@ -69,10 +69,13 @@ int main() {
     } else if (op == "fusion" || op == "fusion_update") {
       pubs = Json::array();
       Fusion::Result r = op == "fusion" ? fusion->on_message(c.value("topic", ""), c.value("payload", Json()))
-                                        : fusion->update(c.value("radar", Json()), c.value("cry", Json()), c.value("env", Json()));
+                                        : fusion->update(c.value("radar", Json()), c.value("cry", Json()), c.value("env", Json()),
+                                                         c.value("tof", Json()));
       out(Json{{"level", r.level}, {"reasons", r.reasons}, {"emitted", r.alert_emitted}, {"pubs", pubs}});
     } else if (op == "decide") {
-      out(decision_json(decide(c.value("radar", Json()), c.value("cry", Json()), c.value("env", Json()))));
+      std::optional<double> stand_s;
+      if (c.contains("stand_s") && c["stand_s"].is_number()) stand_s = c["stand_s"].get<double>();
+      out(decision_json(decide(c.value("radar", Json()), c.value("cry", Json()), c.value("env", Json()), stand_s)));
     } else if (op == "single") {
       out(decision_json(single_sensor_decide(c.value("radar", Json()), c.value("cry", Json()), c.value("env", Json()))));
     } else if (op == "sleep") {

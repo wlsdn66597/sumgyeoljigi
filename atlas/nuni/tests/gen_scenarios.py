@@ -66,6 +66,19 @@ def env_payload(r):
     return p
 
 
+def tof_payload(r):
+    """ToF(난간 높이, 수평): 감지가 몇 초씩 이어지도록 detected를 자주 유지한다(STAND_MIN_S 2초·STAND_LONG_S 30초 시험)."""
+    if r.random() < 0.03:
+        return {}
+    p = {}
+    if r.random() > 0.03:
+        p["distance_mm"] = int(pick(r, [0, 8190, 300, 600], 50, 1200))
+    if r.random() > 0.03:
+        p["detected"] = r.choice([True, True, False, False, False, 1, 0])
+    p["ts"] = 0
+    return p
+
+
 def fusion_session(r, out, steps):
     out.append({"op": "fusion_new", "debounce_n": r.choice([1, 2, 2, 3]), "cooldown_s": r.choice([5, 10, 10, 15])})
     t = 1_700_000_000.0
@@ -75,11 +88,12 @@ def fusion_session(r, out, steps):
         if k < 0.04:
             out.append({"op": "fusion_update", "t": t, "radar": radar_payload(r) if r.random() < .7 else None,
                         "cry": cry_payload(r) if r.random() < .7 else None,
-                        "env": env_payload(r) if r.random() < .7 else None})
+                        "env": env_payload(r) if r.random() < .7 else None,
+                        "tof": tof_payload(r) if r.random() < .5 else None})
             continue
-        topic = r.choices(["sensor/radar", "audio/cry", "sensor/env", "audio/voice"], [5, 4, 2, 0.2])[0]
+        topic = r.choices(["sensor/radar", "audio/cry", "sensor/env", "sensor/tof", "audio/voice"], [5, 4, 2, 4, 0.2])[0]
         payload = {"sensor/radar": radar_payload, "audio/cry": cry_payload, "sensor/env": env_payload,
-                   "audio/voice": lambda _r: {"intent": "status"}}[topic](r)
+                   "sensor/tof": tof_payload, "audio/voice": lambda _r: {"intent": "status"}}[topic](r)
         for _ in range(r.choice([1, 1, 1, 2, 3])):   # 같은 메시지 반복(디바운스·쿨다운 시험)
             out.append({"op": "fusion", "t": t, "topic": topic, "payload": payload})
             t += 1.0
@@ -90,7 +104,8 @@ def rules(r, out, n):
         radar = radar_payload(r) if r.random() < 0.9 else None
         cry = cry_payload(r) if r.random() < 0.8 else None
         env = env_payload(r) if r.random() < 0.8 else None
-        out.append({"op": "decide", "radar": radar, "cry": cry, "env": env})
+        stand_s = r.choice([None, None, 0.0, 1.99, 2.0, 2.01, 29.99, 30.0, 45.0, round(r.uniform(0, 60), 2)])
+        out.append({"op": "decide", "radar": radar, "cry": cry, "env": env, "stand_s": stand_s})
         out.append({"op": "single", "radar": radar, "cry": cry, "env": env})
         out.append({"op": "sleep", "radar": radar, "cry": cry})
         out.append({"op": "env", "env": env, "ss": r.choice(["calm_sleep", "restless", "awake", "unknown", "hold", ""])})

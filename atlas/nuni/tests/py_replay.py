@@ -57,10 +57,10 @@ def main():
             if op == "fusion":
                 level, reasons, emitted = fusion.on_message(c.get("topic", ""), c.get("payload"))
             else:
-                level, reasons, emitted = fusion.update(c.get("radar"), c.get("cry"), c.get("env"))
+                level, reasons, emitted = fusion.update(c.get("radar"), c.get("cry"), c.get("env"), c.get("tof"))
             out = {"level": level, "reasons": reasons, "emitted": emitted, "pubs": list(_pubs)}
         elif op == "decide":
-            level, reasons = fusion_mod.decide(c.get("radar"), c.get("cry"), c.get("env"))
+            level, reasons = fusion_mod.decide(c.get("radar"), c.get("cry"), c.get("env"), c.get("stand_s"))
             out = {"level": level, "reasons": reasons}
         elif op == "single":
             level, reasons = fusion_mod.single_sensor_decide(c.get("radar"), c.get("cry"), c.get("env"))

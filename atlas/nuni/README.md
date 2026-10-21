@@ -6,6 +6,7 @@
 ```
  MR60BHA2(ESPHome) ─ mr60bha2/* ─┐                         ┌─ sensor/radar ─┐
  ESP32(SCD41 등) ─── sensor/env ─┤      MQTT 브로커         │                 │
+ ESP32(VL53L1X) ──── sensor/tof ─┤                          │                 │
                                  └──▶ (nuni-mosquitto) ◀───┤  [radar 모듈]   │
                                           │   ▲             │                 ▼
                                           │   └─ audio/cry ─┤  [cry 모듈] ◀── 마이크(PulseAudio)
@@ -220,6 +221,25 @@ python atlas/nuni/tests/cry_log_parity.py --replay "wsl -d Ubuntu-22.04 -u jinu 
 (ESC-50 아기 울음 15초 + 정적 14초 반복)과 시험 폴더를 주고, 울음 시작 → 끝 → `AnswerCry(feed)` → 다음 울음 중 `AnswerCryNot(diaper)`를 확인했다.
 수유 답 뒤 다음 울음의 1순위가 수유에서 안아주기로 바뀌었다(방금 수유한 맥락). 휴대폰 녹음 칭얼거림(donateacry)은 YAMNet 울음 점수가 낮아
 (대부분 0.1 미만) 잡음으로 버려졌다.
+
+## ToF 일어섬 감지 (`sensor/tof`)
+
+VL53L1X를 침대 난간 높이에 수평으로 달아 침대를 가로질러 본다. 빔에 무언가 걸리면(거리가 침대 폭보다 짧아지면) 아기가 일어선 것으로 본다.
+
+| 항목 | 내용 |
+|---|---|
+| 메시지 | `{"distance_mm": 320, "detected": true, "ts": 1792589447.4}` — ESP32가 0.5초쯤마다 보낸다 |
+| `detected` | ESP32가 정한다: 거리 < (침대 안쪽 폭 − 여유). 기준값은 설치하고 재서 정한다 |
+| 일어섬 | `detected`가 **2초** 넘게 이어지면 `attention` "아기 일어섬(난간 높이 감지)" → 진동 짧게 1번 |
+| 경보 | 일어선 채 **울음**이면 "일어서서 울음", **30초** 넘게 서 있으면 "오래 서 있음(낙상 주의)" → `alert` |
+| 끊김 | ToF 메시지가 **5초** 넘게 안 오면 감지 없음으로 본다 |
+| 상태 | `fusion/state`에 `standing`(참/거짓), 일어서 있는 동안 수면 상태는 `awake`("일어섬 감지"). D-Bus `GetSensors`에 `tof` |
+
+시간 값은 `fusion.py`의 `STAND_MIN_S` · `STAND_LONG_S` · `TOF_STALE_S`(C++은 `fusion.hpp`)에 있다. 하드웨어 없이 시험할 때:
+
+```bash
+for i in $(seq 1 10); do mosquitto_pub -t sensor/tof -m '{"distance_mm":320,"detected":true,"ts":0}'; sleep 0.5; done
+```
 
 ## 진동 노드 `nunivibe` (파이 4)
 

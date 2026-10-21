@@ -334,13 +334,13 @@ int main(int argc, char** argv) {
   if (o.radar)
     for (const auto& t : radar.esphome_topics()) mqtt.subscribe(t);
   if (o.fusion)
-    for (const char* t : {topics::RADAR, topics::CRY, topics::ENV}) mqtt.subscribe(t);
+    for (const char* t : {topics::RADAR, topics::CRY, topics::ENV, topics::TOF}) mqtt.subscribe(t);
 
   bool warned_bad = false;
   mqtt.set_on_message([&](const std::string& topic, const std::string& raw) {
     ++n_in;
     if (o.radar && topic.rfind(radar.config().prefix + "/", 0) == 0) radar.on_esphome(topic, raw, wall_now());
-    if (!o.fusion || !(topic == topics::RADAR || topic == topics::CRY || topic == topics::ENV)) return;
+    if (!o.fusion || !(topic == topics::RADAR || topic == topics::CRY || topic == topics::ENV || topic == topics::TOF)) return;
     auto j = parse_payload(raw);
     if (!j || !j->is_object()) {
       // Python 원본은 여기서 예외로 멈춘다. C++은 그 메시지만 버리고 계속 간다.
@@ -350,7 +350,7 @@ int main(int argc, char** argv) {
     }
 #ifdef NUNI_WITH_DBUS
     if (dbus) {
-      dbus->set_sensor(topic == topics::RADAR ? "radar" : topic == topics::CRY ? "cry" : "env", *j);
+      dbus->set_sensor(topic == topics::RADAR ? "radar" : topic == topics::CRY ? "cry" : topic == topics::TOF ? "tof" : "env", *j);
       if (topic == topics::CRY) {
         const bool crying = truthy(pyget(*j, "is_crying"));
         if (crying && !last_crying) dbus->emit_cry(num_or(pyget(*j, "confidence", 0), 0));

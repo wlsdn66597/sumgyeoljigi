@@ -14,6 +14,7 @@ VOICE = "audio/voice"         # 부모 음성 인텐트
 FUSION_STATE = "fusion/state"  # 융합 판단 현재 상태
 ALERT = "fusion/alert"        # 경보 이벤트
 CONTROL = "control/action"    # 선제 환경 제어 권고
+TOF = "sensor/tof"            # ToF 거리 센서(VL53L1X, ESP32) — 침대 난간 높이에서 수평으로 본다
 
 
 def now() -> float:
@@ -34,6 +35,11 @@ def env_msg(temp: float, humidity: float, co2: int, lux: float) -> dict:
 def cry_msg(is_crying: bool, cls: str, confidence: float) -> dict:
     """cls: hungry/sleepy/discomfort/none, confidence: 0~1"""
     return {"is_crying": is_crying, "cls": cls, "confidence": confidence, "ts": now()}
+
+
+def tof_msg(distance_mm: int, detected: bool) -> dict:
+    """distance_mm: 측정 거리, detected: 난간 높이 빔에 무언가 있음(아기가 일어섬). 판단은 ESP32가 한다."""
+    return {"distance_mm": distance_mm, "detected": detected, "ts": now()}
 
 
 def voice_msg(intent: str) -> dict:

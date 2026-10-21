@@ -48,6 +48,7 @@ def _start_pipeline():
     bus.subscribe(topics.RADAR, f.on_message)
     bus.subscribe(topics.CRY, f.on_message)
     bus.subscribe(topics.ENV, f.on_message)
+    bus.subscribe(topics.TOF, f.on_message)
     threading.Thread(target=_sensor_loop, daemon=True).start()
     threading.Thread(target=_cry_loop, daemon=True).start()
 
